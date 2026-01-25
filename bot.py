@@ -1,6 +1,3 @@
-ЛЮКС ВЕРСИЯ БОТА!!!
-
-
 import logging
 import os
 import requests
