@@ -577,21 +577,21 @@ async def job_send_best_signal(context: ContextTypes.DEFAULT_TYPE):
 
     now = datetime.now()
 
-    # Выходной режим
-    if not is_market_open_now():
-        today = now.strftime("%Y-%m-%d")
-        if LAST_WEEKEND_NOTICE_DATE != today:
-            LAST_WEEKEND_NOTICE_DATE = today
-            await context.bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=(
-                    f"⏸ {CHANNEL_NAME} | Выходной режим\n\n"
-                    "Рынок закрыт (Forex).\n"
-                    "Анализ возобновится в понедельник."
-                )
-            )
-        logger.info("Weekend mode: skip scanning")
-        return
+    # # Выходной режим
+# if not is_market_open(now):
+#     today = now.strftime("%Y-%m-%d")
+#     if LAST_WEEKEND_NOTICE_DATE != today:
+#         LAST_WEEKEND_NOTICE_DATE = today
+#         await context.bot.send_message(
+#             chat_id=CHANNEL_ID,
+#             text=(
+#                 f"📢 {CHANNEL_NAME} | Выходной режим\n\n"
+#                 "Рынок закрыт (Forex).\n"
+#                 "Анализ возобновится в понедельник."
+#             )
+#         )
+#     logger.info("Weekend mode: skip scanning")
+#     return
 
     # 4) глобальная пауза после лоссов
     if GLOBAL_PAUSE_UNTIL and now < GLOBAL_PAUSE_UNTIL:
