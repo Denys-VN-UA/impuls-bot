@@ -235,18 +235,12 @@ def direction_confirm_5m(df: pd.DataFrame):
 def format_signal_text(pair: str, direction: str, probability: int, snap: dict, atr_pct: float):
     entry = datetime.now() + timedelta(seconds=ENTRY_DELAY_SECONDS)
     exit_ = entry + timedelta(minutes=EXPIRATION_MINUTES)
-    if direction == "CALL":
-    arrow = "📈⬆️"
-    dir_text = "CALL (вверх)"
-    trend_text = "📈 ТРЕНД ВВЕРХ"
-else:
-    arrow = "📉⬇️"
-    dir_text = "PUT (вниз)"
-    trend_text = "📉 ТРЕНД ВНИЗ"
+
+    arrow = "📈⬆️" if direction == "CALL" else "📉⬇️"
 
     return (
         f"📊 СИГНАЛ {pair}\n"
-        f"{arrow} {direction}\n"
+        f"{arrow} Направление: {direction}\n"
         f"🔥 Вероятность: {probability}%\n"
         f"📐 ATR(14): {atr_pct:.3f}%\n\n"
         f"💰 Цена: {snap['price']:.5f}\n"
