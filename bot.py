@@ -1,10 +1,20 @@
+# bot.py
+# IMPULS ⚡ — TOP 1-3 лучших сигналов + авто-отчёт после сделки + таймзона + стрелки
+# python-telegram-bot[job-queue]==22.5
+
 import os
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+import numpy as np
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
+from typing import Optional, Any, List
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -12,363 +22,522 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ===================== ЛОГИ =====================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("impuls")
-
-# ===================== НАСТРОЙКИ ИЗ RAILWAY VARIABLES =====================
+# =========================
+# НАСТРОЙКИ (ENV)
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
 
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+# Канал куда бот постит сигналы:
+# Вариант 1: numeric id -100xxxxxxxxxx
+# Вариант 2: @username_channel
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # обязателен на Railway
+
+# Владелец (только он может /stats /report_now /pulse_on /pulse_off и ставить WIN/LOSS)
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv")
 
-# если хочешь менять без кода — добавляй в Variables
-SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "180"))  # 3 мин
-ENTRY_DELAY_SECONDS = int(os.getenv("ENTRY_DELAY_SECONDS", "30"))
-EXPIRATION_MINUTES = int(os.getenv("EXPIRATION_MINUTES", "3"))
+# Название канала (в тексте)
+CHANNEL_NAME = os.getenv("CHANNEL_NAME", "IMPULS ⚡")
 
-# режим отправки:
-# ALL = отправлять каждый подходящий сигнал
-# BEST = слать только лучший
-SEND_MODE = os.getenv("SEND_MODE", "ALL").strip().upper()
+# Таймзона
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Kyiv")
+TZ = ZoneInfo(TIMEZONE_NAME)
 
-# строгость (Pocket Option 1m лучше ниже)
-MIN_PROB_TO_SEND = int(os.getenv("MIN_PROB_TO_SEND", "65"))
+# Интервалы
+SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "180"))  # 3 минуты
+PULSE_INTERVAL_SECONDS = int(os.getenv("PULSE_INTERVAL_SECONDS", "600"))    # 10 минут
+REPORT_HOUR = int(os.getenv("REPORT_HOUR", "22"))
+REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "0"))
 
-# анти-спам по одной паре
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "8"))
+# Пары для сканера
+DEFAULT_SYMBOLS = os.getenv(
+    "SYMBOLS",
+    "USD/JPY,USD/CHF,EUR/USD,GBP/USD,EUR/JPY,GBP/JPY,AUD/USD,USD/CAD"
+).split(",")
 
-# индикаторы
-RSI_PERIOD = 14
-EMA_FAST = 50
-EMA_SLOW = 200
-ATR_PERIOD = 14
+# Таймфрейм и свечи
+TF = os.getenv("TF", "1min")
+CANDLES = int(os.getenv("CANDLES", "260"))
 
-# сколько свечей брать
-OUTPUTSIZE_1M = int(os.getenv("OUTPUTSIZE_1M", "260"))
-OUTPUTSIZE_5M = int(os.getenv("OUTPUTSIZE_5M", "260"))
+# Экспирация
+EXPIRY_MINUTES = int(os.getenv("EXPIRY_MINUTES", "3"))
 
-# --- Pocket Option (1m): ATR пороги в % (КЛЮЧЕВО, иначе сигналов нет) ---
-ATR_THRESHOLDS = {
-    "EUR/USD": float(os.getenv("ATR_EURUSD", "0.006")),
-    "GBP/USD": float(os.getenv("ATR_GBPUSD", "0.007")),
-    "USD/JPY": float(os.getenv("ATR_USDJPY", "0.006")),
-    "AUD/USD": float(os.getenv("ATR_AUDUSD", "0.005")),
-    "USD/CAD": float(os.getenv("ATR_USDCAD", "0.005")),
-    "USD/CHF": float(os.getenv("ATR_USDCHF", "0.005")),
-    "NZD/USD": float(os.getenv("ATR_NZDUSD", "0.005")),
+# ====== РЕЖИМ ОТПРАВКИ ======
+# TOP = отправлять TOP_N лучших (рекомендуется)
+# BEST = отправлять только 1 лучшую
+SEND_MODE = os.getenv("SEND_MODE", "TOP").strip().upper()
+
+TOP_N = int(os.getenv("TOP_N", "2"))  # 1 / 2 / 3
+TOP_N = max(1, min(3, TOP_N))
+
+# ====== НЕ МОЛЧАЛ (мягкие пороги) ======
+# Минимальная вероятность, чтобы отправлять (ниже = больше сигналов)
+MIN_PROBABILITY = int(os.getenv("MIN_PROBABILITY", "63"))
+
+# Порог волатильности ATR% (для 1min Pocket Option нужен НИЖЕ, иначе "low vol")
+# Если молчит — поставь в Railway ATR_THRESHOLD=0.006 или 0.005
+ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.006"))
+
+# анти-спам (на одну пару)
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "6"))
+
+# =========================
+# ЛОГИ
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("impuls")
+
+# =========================
+# СТАТИСТИКА (в памяти)
+# =========================
+STATS = {
+    "signals": 0,
+    "win": 0,
+    "loss": 0,
+    "last_signal": None,
+    "pulse_on": True,
 }
-DEFAULT_ATR_PCT = float(os.getenv("ATR_DEFAULT", "0.005"))
 
-# хочешь ещё чаще — поставь меньше
-GLOBAL_ATR_MULT = float(os.getenv("GLOBAL_ATR_MULT", "1.0"))  # 1.0 = как есть, 0.8 = мягче
+# анти-спам
+LAST_SENT = {}  # symbol -> datetime
 
-# подтверждение 5m (жрёт API). По умолчанию выключено.
-MTF_CONFIRM = os.getenv("MTF_CONFIRM", "0").strip() == "1"
+# =========================
+# УТИЛИТЫ
+# =========================
+def now_tz() -> datetime:
+    return datetime.now(TZ)
 
-PAIRS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD"
-]
+def fmt_dt(dt: datetime) -> str:
+    return dt.astimezone(TZ).strftime("%d.%m.%Y %H:%M:%S")
 
-# ===================== ПРОВЕРКИ =====================
-def require_env():
+def fmt_time(dt: datetime) -> str:
+    return dt.astimezone(TZ).strftime("%H:%M:%S")
+
+def direction_label(direction: str) -> str:
+    # Без CALL/PUT в тексте — стрелки + вверх/вниз
+    return "⬆️ ВВЕРХ" if direction.upper() == "CALL" else "⬇️ ВНИЗ"
+
+def require_env() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("❌ BOT_TOKEN пустой. Railway → Variables → BOT_TOKEN")
+        raise RuntimeError("BOT_TOKEN пустой. Добавь переменную окружения BOT_TOKEN.")
     if not TWELVE_API_KEY:
-        raise RuntimeError("❌ TWELVE_API_KEY пустой. Railway → Variables → TWELVE_API_KEY")
-    if CHANNEL_ID == 0:
-        raise RuntimeError("❌ CHANNEL_ID пустой. Railway → Variables → CHANNEL_ID")
+        raise RuntimeError("TWELVE_API_KEY пустой. Добавь переменную окружения TWELVE_API_KEY.")
+    if not CHANNEL_ID:
+        raise RuntimeError("CHANNEL_ID пустой. Добавь переменную окружения CHANNEL_ID.")
     if OWNER_ID == 0:
-        raise RuntimeError("❌ OWNER_ID пустой. Railway → Variables → OWNER_ID")
+        log.warning("OWNER_ID не задан (0). Кнопки WIN/LOSS и owner-команды будут недоступны.")
 
-# ===================== СТАТЫ / ПАМЯТЬ =====================
-STATS = {"win": 0, "loss": 0}
-LAST_SENT = {}  # pair -> datetime
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID != 0 and user_id == OWNER_ID
 
-# ===================== КНОПКИ =====================
-def winloss_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ WIN", callback_data="WIN"),
-        InlineKeyboardButton("❌ LOSS", callback_data="LOSS"),
-    ]])
+# =========================
+# TWELVE DATA
+# =========================
+TD_BASE = "https://api.twelvedata.com"
 
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "WIN":
-        STATS["win"] += 1
-    elif query.data == "LOSS":
-        STATS["loss"] += 1
-
-    total = STATS["win"] + STATS["loss"]
-    winrate = round((STATS["win"] / total) * 100, 1) if total else 0.0
-
-    await query.message.reply_text(
-        f"📊 Статистика\nWIN: {STATS['win']}\nLOSS: {STATS['loss']}\nWinrate: {winrate}%"
-    )
-
-# ===================== INDICATORS =====================
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def calculate_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    x = df.copy()
-    if "high" in x.columns and "low" in x.columns:
-        prev_close = x["close"].shift(1)
-        tr = pd.concat([
-            (x["high"] - x["low"]),
-            (x["high"] - prev_close).abs(),
-            (x["low"] - prev_close).abs(),
-        ], axis=1).max(axis=1)
-    else:
-        tr = x["close"].diff().abs()
-    return tr.rolling(period).mean()
-
-# ===================== DATA (TWELVE) =====================
-def get_market_data(pair: str, interval: str, outputsize: int):
-    url = "https://api.twelvedata.com/time_series"
+def td_time_series(symbol: str, interval: str, outputsize: int = 260) -> pd.DataFrame:
+    url = f"{TD_BASE}/time_series"
     params = {
-        "symbol": pair,
+        "symbol": symbol,
         "interval": interval,
         "outputsize": outputsize,
         "apikey": TWELVE_API_KEY,
+        "format": "JSON",
+        "timezone": "UTC",
     }
-    try:
-        r = requests.get(url, params=params, timeout=12)
-        data = r.json()
-    except Exception as e:
-        return None, f"Request error: {e}"
+    r = requests.get(url, params=params, timeout=20)
+    data = r.json()
 
     if data.get("status") == "error":
-        return None, data.get("message", "API error")
+        raise RuntimeError(f"TwelveData error for {symbol}: {data.get('message')}")
 
-    values = data.get("values")
+    values = data.get("values") or []
     if not values:
-        return None, "No candle data"
+        raise RuntimeError(f"No candles returned for {symbol}")
 
     df = pd.DataFrame(values)
-    for col in ("open", "high", "low", "close"):
-        if col in df.columns:
-            df[col] = df[col].astype(float)
+    # values latest->oldest, reverse to oldest->latest
+    df = df.iloc[::-1].reset_index(drop=True)
 
-    df = df.sort_values("datetime")
-    return df, None
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# ===================== SIGNAL LOGIC (ослаблено) =====================
-def build_signal_1m(df: pd.DataFrame):
-    x = df.copy()
-    x["ema50"] = calculate_ema(x["close"], EMA_FAST)
-    x["ema200"] = calculate_ema(x["close"], EMA_SLOW)
-    x["rsi"] = calculate_rsi(x["close"], RSI_PERIOD)
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+    df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
+    return df
 
-    last = x.iloc[-1]
-    price = float(last["close"])
-    ema50 = float(last["ema50"])
-    ema200 = float(last["ema200"])
-    rsi = float(last["rsi"]) if pd.notna(last["rsi"]) else None
+# =========================
+# ИНДИКАТОРЫ
+# =========================
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
-    snap = {"price": price, "ema50": ema50, "ema200": ema200, "rsi": rsi}
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan))
+    return 100 - (100 / (1 + rs))
 
-    if rsi is None:
-        return None, 0, "Not enough RSI", snap
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1
+    ).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
-    # Ослабляем: флэт уже 47-53 (а не 45-55)
-    if 47 <= rsi <= 53:
-        return None, 0, "Flat RSI (47–53)", snap
+def atr_percent(df: pd.DataFrame, period: int = 14) -> float:
+    a = atr(df, period).iloc[-1]
+    c = df["close"].iloc[-1]
+    if c == 0 or pd.isna(a) or pd.isna(c):
+        return 0.0
+    return float((a / c) * 100.0)
 
-    # Экстремумы ослабляем: только если совсем жёстко
-    if rsi >= 78 or rsi <= 22:
-        return None, 0, "RSI hard extreme", snap
+# =========================
+# ЛОГИКА СИГНАЛА (мягкая, чтобы не молчал)
+# =========================
+@dataclass
+class Signal:
+    symbol: str
+    direction: str
+    probability: int
+    price: float
+    rsi14: float
+    ema50: float
+    ema200: float
+    atr14_pct: float
+    entry_time: datetime
+    exit_time: datetime
+    reason: str
 
-    trend_up = ema50 > ema200
-    trend_down = ema50 < ema200
-    if not (trend_up or trend_down):
-        return None, 0, "No EMA trend", snap
+def compute_signal(symbol: str) -> Optional[Signal]:
+    df = td_time_series(symbol, TF, CANDLES)
 
-    # тренд-сила (мягче чем раньше)
-    trend_strength = abs(ema50 - ema200) / price * 100
-    ts = min(1.0, trend_strength / 0.12)  # раньше было 0.20 (жёстко)
+    df["ema50"] = ema(df["close"], 50)
+    df["ema200"] = ema(df["close"], 200)
+    df["rsi14"] = rsi(df["close"], 14)
+    atr_pct = atr_percent(df, 14)
 
-    ideal = 55 if trend_up else 45
-    rsi_dist = abs(rsi - ideal)
-    rs = max(0.0, 1.0 - (rsi_dist / 22.0))
+    # ATR фильтр (мягкий)
+    if atr_pct < ATR_THRESHOLD:
+        return None
 
-    price_ok = (price > ema50) if trend_up else (price < ema50)
-    ps = 1.0 if price_ok else 0.2  # раньше было 0/1
+    close = float(df["close"].iloc[-1])
+    ema50_v = float(df["ema50"].iloc[-1])
+    ema200_v = float(df["ema200"].iloc[-1])
+    rsi_v = float(df["rsi14"].iloc[-1])
 
-    score01 = 0.45 * ts + 0.35 * rs + 0.20 * ps
+    trend_up = ema50_v > ema200_v
+    trend_down = ema50_v < ema200_v
 
-    # порог сигнала мягче
-    if score01 < 0.52:
-        return None, 0, f"Weak score ({score01:.2f})", snap
+    direction = None
+    score = 0
+    reasons = []
 
-    probability = int(round(55 + score01 * 40))  # чаще 65-90
-    probability = max(55, min(90, probability))
+    # Мягкие зоны RSI, чтобы чаще давал сигналы
+    # UP: 43..67, DOWN: 33..57 (для 3 минут)
+    if trend_up:
+        score += 35
+        reasons.append("EMA50 > EMA200 (вверх)")
+        if 43 <= rsi_v <= 67:
+            score += 35
+            direction = "CALL"
+            reasons.append("RSI подтверждает вверх")
+        else:
+            reasons.append("RSI слабый вверх")
+    elif trend_down:
+        score += 35
+        reasons.append("EMA50 < EMA200 (вниз)")
+        if 33 <= rsi_v <= 57:
+            score += 35
+            direction = "PUT"
+            reasons.append("RSI подтверждает вниз")
+        else:
+            reasons.append("RSI слабый вниз")
+    else:
+        return None
 
-    direction = "CALL" if trend_up else "PUT"
-    reason = f"RSI={rsi:.1f}; EMA50 {'>' if trend_up else '<'} EMA200; price_ok={price_ok}"
-    return direction, probability, reason, snap
+    # бонус за волатильность
+    vol_bonus = min(20, int((atr_pct / max(ATR_THRESHOLD, 0.0001)) * 5))
+    score += vol_bonus
+    reasons.append(f"ATR {atr_pct:.3f}%")
 
-def direction_confirm_5m(df: pd.DataFrame):
-    x = df.copy()
-    x["ema50"] = calculate_ema(x["close"], EMA_FAST)
-    x["ema200"] = calculate_ema(x["close"], EMA_SLOW)
-    last = x.iloc[-1]
-    if float(last["ema50"]) > float(last["ema200"]):
-        return "CALL"
-    if float(last["ema50"]) < float(last["ema200"]):
-        return "PUT"
-    return None
+    if direction is None:
+        return None
 
-def format_signal_text(pair: str, direction: str, probability: int, snap: dict, atr_pct: float):
-    entry = datetime.now() + timedelta(seconds=ENTRY_DELAY_SECONDS)
-    exit_ = entry + timedelta(minutes=EXPIRATION_MINUTES)
+    probability = max(55, min(92, int(score)))
 
-    arrow = "📈⬆️" if direction == "CALL" else "📉⬇️"
+    # фильтр по вероятности (чтобы не слал совсем слабые)
+    if probability < MIN_PROBABILITY:
+        return None
+
+    entry = now_tz()
+    exit_ = entry + timedelta(minutes=EXPIRY_MINUTES)
+
+    return Signal(
+        symbol=symbol,
+        direction=direction,
+        probability=probability,
+        price=close,
+        rsi14=rsi_v,
+        ema50=ema50_v,
+        ema200=ema200_v,
+        atr14_pct=atr_pct,
+        entry_time=entry,
+        exit_time=exit_,
+        reason=" | ".join(reasons),
+    )
+
+def collect_signals(symbols: List[str]) -> List[Signal]:
+    out: List[Signal] = []
+    now = now_tz()
+
+    for s in symbols:
+        s = s.strip()
+        if not s:
+            continue
+
+        # анти-спам
+        last = LAST_SENT.get(s)
+        if last and (now - last).total_seconds() < COOLDOWN_MINUTES * 60:
+            continue
+
+        try:
+            sig = compute_signal(s)
+        except Exception as e:
+            log.warning("Signal error for %s: %s", s, e)
+            continue
+
+        if sig:
+            out.append(sig)
+
+    out.sort(key=lambda x: x.probability, reverse=True)
+    return out
+
+# =========================
+# TELEGRAM: сообщения
+# =========================
+def signal_message(sig: Signal) -> str:
+    dir_text = direction_label(sig.direction)
+    trend_line = "📈 ТРЕНД ВВЕРХ" if sig.direction == "CALL" else "📉 ТРЕНД ВНИЗ"
+    arrow = "📈⬆️" if sig.direction == "CALL" else "📉⬇️"
 
     return (
-        f"📊 СИГНАЛ {pair}\n"
-        f"{arrow} Направление: {direction}\n"
-        f"🔥 Вероятность: {probability}%\n"
-        f"📐 ATR(14): {atr_pct:.3f}%\n\n"
-        f"💰 Цена: {snap['price']:.5f}\n"
-        f"📉 RSI(14): {snap['rsi']:.1f}\n"
-        f"📈 EMA50: {snap['ema50']:.5f}\n"
-        f"📈 EMA200: {snap['ema200']:.5f}\n\n"
-        f"⏰ Вход: {entry.strftime('%H:%M:%S')}\n"
-        f"⌛ Экспирация: {EXPIRATION_MINUTES} мин\n"
-        f"🏁 Выход: {exit_.strftime('%H:%M:%S')}"
+        f"📊 *СИГНАЛ {sig.symbol}*\n"
+        f"{trend_line}\n"
+        f"{arrow} Направление: *{dir_text}*\n"
+        f"🔥 Вероятность: *{sig.probability}%*\n\n"
+        f"💰 Цена: `{sig.price:.5f}`\n"
+        f"📉 RSI(14): `{sig.rsi14:.1f}`\n"
+        f"📍 EMA50: `{sig.ema50:.5f}`\n"
+        f"📍 EMA200: `{sig.ema200:.5f}`\n"
+        f"⚡ ATR(14): `{sig.atr14_pct:.3f}%`\n\n"
+        f"⏱ Вход: *{fmt_time(sig.entry_time)}*\n"
+        f"🏁 Выход: *{fmt_time(sig.exit_time)}*  (экспирация {EXPIRY_MINUTES} мин)\n"
+        f"🌍 Таймзона: `{TIMEZONE_NAME}`\n"
     )
 
-# ===================== COMMANDS =====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def winloss_keyboard(signal_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ WIN", callback_data=f"wl|win|{signal_id}"),
+            InlineKeyboardButton("❌ LOSS", callback_data=f"wl|loss|{signal_id}"),
+        ]]
+    )
+
+async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+        disable_web_page_preview=True,
+    )
+
+def mini_report_text() -> str:
+    s = STATS["signals"]
+    w = STATS["win"]
+    l = STATS["loss"]
+    wr = (w / max(1, w + l)) * 100.0
+    return (
+        f"📌 *{CHANNEL_NAME} — ОТЧЁТ ПО СДЕЛКЕ*\n"
+        f"📨 Сигналов всего: *{s}*\n"
+        f"✅ WIN: *{w}*\n"
+        f"❌ LOSS: *{l}*\n"
+        f"🎯 WinRate: *{wr:.1f}%*\n"
+        f"🕒 {now_tz().strftime('%H:%M:%S')} ({TIMEZONE_NAME})"
+    )
+
+# =========================
+# JOBS
+# =========================
+async def job_send_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
+    signals = collect_signals(DEFAULT_SYMBOLS)
+    if not signals:
+        return
+
+    if SEND_MODE == "BEST":
+        signals = signals[:1]
+    else:
+        # TOP по умолчанию: 1-3 лучших
+        signals = signals[:TOP_N]
+
+    for sig in signals:
+        STATS["signals"] += 1
+        signal_id = sig.entry_time.strftime("%Y%m%d%H%M%S")
+        STATS["last_signal"] = {"id": signal_id, "symbol": sig.symbol, "ts": fmt_dt(sig.entry_time)}
+        LAST_SENT[sig.symbol] = now_tz()
+
+        await post_to_channel(context, signal_message(sig), reply_markup=winloss_keyboard(signal_id))
+
+async def job_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not STATS.get("pulse_on", True):
+        return
+    await post_to_channel(context, f"🕒 *{CHANNEL_NAME}*: бот жив, анализирую рынок…")
+
+async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    s = STATS["signals"]
+    w = STATS["win"]
+    l = STATS["loss"]
+    wr = (w / max(1, w + l)) * 100.0
+
+    txt = (
+        f"📌 *{CHANNEL_NAME} — ЕЖЕДНЕВНЫЙ ОТЧЁТ*\n"
+        f"🗓 Дата: *{now_tz().strftime('%d.%m.%Y')}*  ({TIMEZONE_NAME})\n\n"
+        f"📨 Сигналов: *{s}*\n"
+        f"✅ WIN: *{w}*\n"
+        f"❌ LOSS: *{l}*\n"
+        f"🎯 WinRate: *{wr:.1f}%*\n"
+    )
+    await post_to_channel(context, txt)
+
+# =========================
+# HANDLERS
+# =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🤖 Бот активен.\n"
+        "✅ Бот активен.\n"
+        f"Канал: {CHANNEL_NAME}\n"
+        f"Таймзона: {TIMEZONE_NAME}\n"
+        f"Режим: {SEND_MODE} | TOP_N: {TOP_N}\n\n"
+        "Команды (только владелец):\n"
         "/test — тест в канал\n"
         "/stats — статистика\n"
-        "Сигналы идут в канал автоматически."
+        "/report_now — отчёт сейчас\n"
+        "/pulse_on — включить пульс\n"
+        "/pulse_off — выключить пульс\n",
+        disable_web_page_preview=True,
     )
 
-async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Тест: отправляю сообщение в канал…")
-    await context.bot.send_message(chat_id=CHANNEL_ID, text="✅ ТЕСТ: бот может писать в канал (OK)")
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    await post_to_channel(context, "✅ *ТЕСТ*: бот может писать в канал (OK)")
 
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total = STATS["win"] + STATS["loss"]
-    winrate = round((STATS["win"] / total) * 100, 1) if total else 0.0
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    s = STATS["signals"]
+    w = STATS["win"]
+    l = STATS["loss"]
+    wr = (w / max(1, w + l)) * 100.0
     await update.message.reply_text(
-        f"📊 Статистика\nWIN: {STATS['win']}\nLOSS: {STATS['loss']}\nWinrate: {winrate}%"
+        f"📊 Статистика\n"
+        f"Сигналов: {s}\n"
+        f"WIN: {w}\n"
+        f"LOSS: {l}\n"
+        f"WinRate: {wr:.1f}%\n"
+        f"Режим: {SEND_MODE} | TOP_N: {TOP_N}\n"
+        f"ATR_THRESHOLD: {ATR_THRESHOLD}\n"
+        f"MIN_PROBABILITY: {MIN_PROBABILITY}\n"
+        f"Таймзона: {TIMEZONE_NAME}"
     )
 
-# ===================== JOB =====================
-async def job_scan(context: ContextTypes.DEFAULT_TYPE):
-    now = datetime.now()
+async def report_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    await job_daily_report(context)
+    await update.message.reply_text("✅ Отчёт отправлен в канал.")
 
-    sent_any = False
+async def pulse_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    STATS["pulse_on"] = True
+    await update.message.reply_text("✅ Пульс включён (раз в 10 минут).")
 
-    for pair in PAIRS:
-        # анти-спам
-        last_time = LAST_SENT.get(pair)
-        if last_time and (now - last_time).total_seconds() < COOLDOWN_MINUTES * 60:
-            continue
+async def pulse_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    STATS["pulse_on"] = False
+    await update.message.reply_text("✅ Пульс выключён.")
 
-        df1, err1 = get_market_data(pair, interval="1min", outputsize=OUTPUTSIZE_1M)
-        if err1 or df1 is None or len(df1) < 220:
-            logger.info("skip %s: %s", pair, err1)
-            continue
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
 
-        atr_series = calculate_atr(df1, ATR_PERIOD)
-        atr = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else 0.0
-        price = float(df1["close"].iloc[-1])
-        atr_pct = (atr / price) * 100 if price else 0.0
+    if not is_owner(q.from_user.id):
+        await q.answer("⛔ Только владелец может отмечать WIN/LOSS.", show_alert=True)
+        return
 
-        threshold = ATR_THRESHOLDS.get(pair, DEFAULT_ATR_PCT) * GLOBAL_ATR_MULT
-        if atr_pct < threshold:
-            logger.info("low vol %s atr%%=%.3f (thr=%.3f)", pair, atr_pct, threshold)
-            continue
+    data = (q.data or "").split("|")
+    if len(data) != 3 or data[0] != "wl":
+        return
 
-        direction1, prob1, reason1, snap1 = build_signal_1m(df1)
-        if direction1 is None:
-            logger.info("no signal %s: %s", pair, reason1)
-            continue
+    action = data[1]
+    signal_id = data[2]
 
-        if MTF_CONFIRM:
-            df5, err5 = get_market_data(pair, interval="5min", outputsize=OUTPUTSIZE_5M)
-            if err5 or df5 is None or len(df5) < 220:
-                logger.info("skip 5m %s: %s", pair, err5)
-                continue
-            direction5 = direction_confirm_5m(df5)
-            if direction5 != direction1:
-                logger.info("mtf reject %s 1m=%s 5m=%s", pair, direction1, direction5)
-                continue
-            prob1 = min(90, prob1 + 3)
+    if action == "win":
+        STATS["win"] += 1
+        await q.message.reply_text(f"✅ Отмечено: WIN (signal_id={signal_id})")
+        await post_to_channel(context, mini_report_text())
 
-        if prob1 < MIN_PROB_TO_SEND:
-            logger.info("prob low %s prob=%s (<%s)", pair, prob1, MIN_PROB_TO_SEND)
-            continue
+    elif action == "loss":
+        STATS["loss"] += 1
+        await q.message.reply_text(f"❌ Отмечено: LOSS (signal_id={signal_id})")
+        await post_to_channel(context, mini_report_text())
 
-        # режим ALL = шлём всё подходящее
-        if SEND_MODE == "ALL":
-            text = format_signal_text(pair, direction1, prob1, snap1, atr_pct)
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=winloss_keyboard())
-            LAST_SENT[pair] = now
-            sent_any = True
-            logger.info("SENT %s %s prob=%s", pair, direction1, prob1)
-
-        # режим BEST = выбираем лучший (если вдруг захочешь)
-        else:
-            # для BEST — просто держим один лучший
-            context.chat_data.setdefault("best", None)
-            best = context.chat_data["best"]
-            cand = (prob1, pair, direction1, snap1, atr_pct)
-            if best is None or cand[0] > best[0]:
-                context.chat_data["best"] = cand
-
-    if SEND_MODE != "ALL":
-        best = context.chat_data.get("best")
-        context.chat_data["best"] = None
-        if not best:
-            logger.info("no strong signals this cycle")
-            return
-        prob, pair, direction, snap, atr_pct = best
-        text = format_signal_text(pair, direction, prob, snap, atr_pct)
-        await context.bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=winloss_keyboard())
-        LAST_SENT[pair] = now
-        sent_any = True
-        logger.info("SENT BEST %s %s prob=%s", pair, direction, prob)
-
-    if not sent_any:
-        logger.info("cycle done: no sends")
-
-# ===================== MAIN =====================
-def main():
+# =========================
+# MAIN
+# =========================
+def main() -> None:
     require_env()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("test", test))
+    app.add_handler(CommandHandler("test", test_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("report_now", report_now))
+    app.add_handler(CommandHandler("pulse_on", pulse_on))
+    app.add_handler(CommandHandler("pulse_off", pulse_off))
     app.add_handler(CallbackQueryHandler(on_button))
 
     if app.job_queue is None:
-        raise RuntimeError("JobQueue не активен. Нужен пакет: python-telegram-bot[job-queue]")
+        raise RuntimeError("JobQueue не активен. Убедись, что установлен пакет python-telegram-bot[job-queue]==22.5")
 
-    app.job_queue.run_repeating(job_scan, interval=SIGNAL_INTERVAL_SECONDS, first=10)
+    # Сканер
+    app.job_queue.run_repeating(job_send_signals, interval=SIGNAL_INTERVAL_SECONDS, first=10)
 
-    print("🚀 Bot started. Mode:", SEND_MODE, "| MTF_CONFIRM:", MTF_CONFIRM, "| TZ:", TIMEZONE)
-    app.run_polling()
+    # Пульс
+    app.job_queue.run_repeating(job_pulse, interval=PULSE_INTERVAL_SECONDS, first=60)
+
+    # Ежедневный отчёт
+    report_t = time(hour=REPORT_HOUR, minute=REPORT_MINUTE, tzinfo=TZ)
+    app.job_queue.run_daily(job_daily_report, time=report_t, name="daily_report")
+
+    log.info("%s | бот запущен | TZ=%s | mode=%s TOP_N=%s | ATR=%.4f | MIN_PROB=%d",
+             CHANNEL_NAME, TIMEZONE_NAME, SEND_MODE, TOP_N, ATR_THRESHOLD, MIN_PROBABILITY)
+
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
