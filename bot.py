@@ -1,8 +1,9 @@
 # bot.py
-# IMPULS ⚡ Alpha Vantage + TOP_N + ADAPTIVE_FILTERS + Auto-report after expiry
+# IMPULS ⚡ — TwelveData версия (TOP_N + не молчит + лимит-защита + adaptive ATR)
 # python-telegram-bot[job-queue]==22.5
 
 import os
+import time as pytime
 import logging
 import requests
 import pandas as pd
@@ -11,7 +12,7 @@ import numpy as np
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
-from typing import Optional, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -23,56 +24,66 @@ from telegram.ext import (
 )
 
 # =========================
-# ENV НАСТРОЙКИ
+# ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-# Alpha Vantage
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
-
-# Channel
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()   # -100... или @username
-
-# Owner
+TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # -100xxxx or @channel
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+CHANNEL_NAME = os.getenv("CHANNEL_NAME", "IMPULS ⚡")
 
-CHANNEL_NAME = os.getenv("CHANNEL_NAME", "IMPULS ⚡").strip()
-
-# TZ
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Kyiv").strip()
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Kyiv")
 TZ = ZoneInfo(TIMEZONE_NAME)
 
-# Symbols (forex pairs)
-# Формат: EUR/USD,USD/JPY,USD/CHF
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "USD/CHF,USD/JPY").split(",") if s.strip()]
+# Частота сканирования
+SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "600"))  # 10 минут по умолчанию
 
-# Jobs intervals
-SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "600"))  # 10 минут (важно для free API)
-PULSE_INTERVAL_SECONDS = int(os.getenv("PULSE_INTERVAL_SECONDS", "600"))    # 10 минут
+# Сколько лучших пар отправлять
+TOP_N = int(os.getenv("TOP_N", "1"))  # 1/2/3
+TOP_N = max(1, min(3, TOP_N))
 
-# Trading params
-EXPIRY_MINUTES = int(os.getenv("EXPIRY_MINUTES", "3"))
-ENTRY_DELAY_SECONDS = int(os.getenv("ENTRY_DELAY_SECONDS", "0"))  # если хочешь вход не сразу — поставь 30
+# Режим отправки:
+# BEST = отправляет только 1 самую лучшую (игнорирует TOP_N)
+# TOP  = отправляет TOP_N лучших (если прошли порог)
+SEND_MODE = os.getenv("SEND_MODE", "TOP").strip().upper()
+if SEND_MODE not in ("BEST", "TOP"):
+    SEND_MODE = "TOP"
 
-# Filters
-ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.020"))  # в % (пример: 0.020%)
-MIN_PROBABILITY = int(os.getenv("MIN_PROBABILITY", "70"))   # минимум вероятности
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "10")) # анти-спам по паре
+# Пары (ВАЖНО: на бесплатном TwelveData ставь 2 пары!)
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "EUR/USD,USD/JPY").split(",") if s.strip()]
 
-# Mode
-SEND_MODE = os.getenv("SEND_MODE", "BEST").strip().upper()  # BEST | ALL
-TOP_N = int(os.getenv("TOP_N", "1"))                        # 1..3
-
-# Adaptive
-ADAPTIVE_FILTERS = os.getenv("ADAPTIVE_FILTERS", "0").strip() in ("1", "true", "True", "YES", "yes")
-
-# Alpha Vantage interval
-# FX_INTRADAY supports: 1min, 5min, 15min, 30min, 60min
-TF = os.getenv("TF", "5min").strip()
+# Таймфрейм и свечи
+TF = os.getenv("TF", "1min")
 CANDLES = int(os.getenv("CANDLES", "250"))
 
+# Экспирация (мин)
+EXPIRY_MINUTES = int(os.getenv("EXPIRY_MINUTES", "3"))
+
+# Порог вероятности, чтобы отправлять
+MIN_PROBABILITY = int(os.getenv("MIN_PROBABILITY", "70"))
+
+# Кулдаун по паре (мин) — чтобы не спамить одной и той же
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "10"))
+
+# ATR порог (%)
+ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.020"))  # в % (0.020% это норм для форекса)
+
+# Адаптивный режим
+ADAPTIVE_FILTERS = os.getenv("ADAPTIVE_FILTERS", "0").strip() in ("1", "true", "True", "YES", "yes")
+
+# Пульс
+PULSE_INTERVAL_SECONDS = int(os.getenv("PULSE_INTERVAL_SECONDS", "900"))  # 15 минут
+PULSE_ON_DEFAULT = os.getenv("PULSE_ON", "1").strip() in ("1", "true", "True", "YES", "yes")
+
+# Ограничение по API (на бесплатном часто 8 credits/min)
+TD_MAX_CALLS_PER_MIN = int(os.getenv("TD_MAX_CALLS_PER_MIN", "8"))
+
+# Ежедневный отчёт (по желанию)
+REPORT_HOUR = int(os.getenv("REPORT_HOUR", "22"))
+REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "0"))
+
 # =========================
-# LOGGING
+# ЛОГИ
 # =========================
 logging.basicConfig(
     level=logging.INFO,
@@ -81,18 +92,29 @@ logging.basicConfig(
 log = logging.getLogger("impuls")
 
 # =========================
-# STATE (in-memory)
+# ПАМЯТЬ/СТАТЫ
 # =========================
-STATS = {"signals": 0, "win": 0, "loss": 0, "pulse_on": True}
+STATS = {
+    "signals": 0,
+    "win": 0,
+    "loss": 0,
+    "pulse_on": PULSE_ON_DEFAULT,
+    "last_signal": None,
+}
 
-# last sent per pair (cooldown)
-LAST_SENT: Dict[str, datetime] = {}
+LAST_SENT_BY_SYMBOL: Dict[str, datetime] = {}
+LAST_NO_SIGNAL_NOTICE: Optional[datetime] = None
+LAST_API_LIMIT_NOTICE: Optional[datetime] = None
 
-# Signals registry: signal_id -> dict(status/outcome/signal)
-SIGNALS: Dict[str, dict] = {}
+# Кеш свечей, чтобы не дергать API чаще чем нужно
+CANDLE_CACHE: Dict[Tuple[str, str], Tuple[datetime, pd.DataFrame]] = {}  # (symbol, tf) -> (ts, df)
+CACHE_TTL_SECONDS = 55  # если вызвали повторно в течение минуты — отдаем кеш
+
+# Простой лимитер вызовов (окно 60 сек)
+TD_CALL_TIMES: List[float] = []  # timestamps (epoch seconds)
 
 # =========================
-# HELPERS
+# УТИЛИТЫ
 # =========================
 def now_tz() -> datetime:
     return datetime.now(TZ)
@@ -106,32 +128,103 @@ def fmt_dt(dt: datetime) -> str:
 def is_owner(user_id: int) -> bool:
     return OWNER_ID != 0 and user_id == OWNER_ID
 
+def direction_label(direction: str) -> str:
+    # без CALL/PUT, только стрелки как ты просил
+    if direction.upper() == "CALL":
+        return "⬆️ ВВЕРХ"
+    return "⬇️ ВНИЗ"
+
 def require_env() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN пустой. Добавь BOT_TOKEN в Railway Variables.")
-    if not ALPHAVANTAGE_API_KEY:
-        raise RuntimeError("ALPHAVANTAGE_API_KEY пустой. Добавь ALPHAVANTAGE_API_KEY в Railway Variables.")
+    if not TWELVE_API_KEY:
+        raise RuntimeError("TWELVE_API_KEY пустой. Добавь TWELVE_API_KEY в Railway Variables.")
     if not CHANNEL_ID:
         raise RuntimeError("CHANNEL_ID пустой. Добавь CHANNEL_ID в Railway Variables.")
-    if OWNER_ID == 0:
-        log.warning("OWNER_ID = 0. WIN/LOSS и owner-команды будут недоступны.")
-
-def direction_label(direction: str) -> str:
-    return "⬆️ ВВЕРХ" if direction == "CALL" else "⬇️ ВНИЗ"
+    if not SYMBOLS:
+        raise RuntimeError("SYMBOLS пустой. Добавь SYMBOLS, например: EUR/USD,USD/JPY")
 
 # =========================
-# INDICATORS
+# TwelveData
+# =========================
+TD_BASE = "https://api.twelvedata.com"
+
+class TwelveLimitError(RuntimeError):
+    pass
+
+def _td_rate_ok() -> bool:
+    """Не даём сделать больше TD_MAX_CALLS_PER_MIN запросов за 60 секунд."""
+    global TD_CALL_TIMES
+    now = pytime.time()
+    TD_CALL_TIMES = [t for t in TD_CALL_TIMES if now - t < 60]
+    return len(TD_CALL_TIMES) < TD_MAX_CALLS_PER_MIN
+
+def _td_mark_call():
+    TD_CALL_TIMES.append(pytime.time())
+
+def td_time_series(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
+    # cache
+    cache_key = (symbol, interval)
+    cached = CANDLE_CACHE.get(cache_key)
+    if cached:
+        ts, df = cached
+        if (now_tz() - ts).total_seconds() <= CACHE_TTL_SECONDS:
+            return df.copy()
+
+    if not _td_rate_ok():
+        raise TwelveLimitError("Local limiter: too many requests per minute")
+
+    url = f"{TD_BASE}/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_API_KEY,
+        "format": "JSON",
+        "timezone": "UTC",
+    }
+
+    _td_mark_call()
+    r = requests.get(url, params=params, timeout=20)
+    data = r.json()
+
+    if data.get("status") == "error":
+        msg = (data.get("message") or "").lower()
+        # TwelveData часто пишет про credits / limit
+        if "credits" in msg or "limit" in msg or "too many" in msg:
+            raise TwelveLimitError(data.get("message") or "TwelveData rate limit")
+        raise RuntimeError(f"TwelveData error for {symbol}: {data.get('message')}")
+
+    values = data.get("values") or []
+    if not values:
+        raise RuntimeError(f"No candles returned for {symbol}")
+
+    df = pd.DataFrame(values)
+    # values идут latest->oldest
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+    df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
+
+    CANDLE_CACHE[cache_key] = (now_tz(), df.copy())
+    return df
+
+# =========================
+# Индикаторы
 # =========================
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
     ma_up = up.ewm(alpha=1/period, adjust=False).mean()
     ma_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = ma_up / ma_down.replace(0, np.nan)
+    rs = ma_up / (ma_down.replace(0, np.nan))
     return 100 - (100 / (1 + rs))
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -145,80 +238,33 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     ).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
-def atr_percent(df: pd.DataFrame, period: int = 14) -> float:
-    a = atr(df, period).iloc[-1]
-    c = df["close"].iloc[-1]
-    if pd.isna(a) or pd.isna(c) or c == 0:
-        return 0.0
-    return float((a / c) * 100.0)
+def atr_pct_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    a = atr(df, period)
+    c = df["close"].replace(0, np.nan)
+    return (a / c) * 100.0
 
-# =========================
-# ALPHA VANTAGE (FX_INTRADAY)
-# =========================
-AV_BASE = "https://www.alphavantage.co/query"
-
-def av_fx_intraday(symbol: str, interval: str, outputsize: str = "compact") -> pd.DataFrame:
+def adaptive_atr_threshold(df: pd.DataFrame, base_thr: float) -> float:
     """
-    symbol format: 'USD/JPY'
-    Alpha Vantage wants from_symbol, to_symbol.
+    Адаптивный порог:
+    берём распределение ATR% за историю и ставим порог на нижний квантиль,
+    чтобы в тихом рынке порог сам падал, а в шумном — рос.
     """
-    if "/" not in symbol:
-        raise RuntimeError(f"Bad symbol format: {symbol} (need like USD/JPY)")
-    f, t = symbol.split("/", 1)
-
-    params = {
-        "function": "FX_INTRADAY",
-        "from_symbol": f,
-        "to_symbol": t,
-        "interval": interval,
-        "outputsize": outputsize,  # compact ~100, full ~10000 (but slower)
-        "apikey": ALPHAVANTAGE_API_KEY,
-    }
-    r = requests.get(AV_BASE, params=params, timeout=25)
-    data = r.json()
-
-    # API limit / notes
-    note = data.get("Note") or data.get("Information")
-    if note:
-        raise RuntimeError("API_LIMIT")
-
-    # key example: "Time Series FX (5min)"
-    ts_key = None
-    for k in data.keys():
-        if "Time Series FX" in k:
-            ts_key = k
-            break
-    if not ts_key or ts_key not in data:
-        raise RuntimeError(f"No time series for {symbol}: {data}")
-
-    ts = data[ts_key]  # dict of "YYYY-MM-DD HH:MM:SS": {1. open, 2. high, 3. low, 4. close}
-    rows = []
-    for dt_str, ohlc in ts.items():
-        rows.append({
-            "datetime": dt_str,
-            "open": float(ohlc.get("1. open", np.nan)),
-            "high": float(ohlc.get("2. high", np.nan)),
-            "low": float(ohlc.get("3. low", np.nan)),
-            "close": float(ohlc.get("4. close", np.nan)),
-        })
-
-    df = pd.DataFrame(rows)
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
-    df = df.dropna(subset=["datetime", "open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
-
-    # keep last CANDLES
-    if len(df) > CANDLES:
-        df = df.iloc[-CANDLES:].reset_index(drop=True)
-
-    return df
+    s = atr_pct_series(df, 14).dropna()
+    if len(s) < 50:
+        return base_thr
+    q = float(np.nanpercentile(s.values, 35))  # 35-й перцентиль
+    # не даём уйти слишком низко/высоко
+    low = base_thr * 0.6
+    high = base_thr * 1.8
+    return max(low, min(high, q))
 
 # =========================
-# SIGNAL LOGIC
+# Сигнал
 # =========================
 @dataclass
 class Signal:
     symbol: str
-    direction: str      # CALL/PUT
+    direction: str  # CALL/PUT
     probability: int
     price: float
     rsi14: float
@@ -228,85 +274,68 @@ class Signal:
     entry_time: datetime
     exit_time: datetime
     reason: str
+    id: str
 
 def compute_signal(symbol: str) -> Optional[Signal]:
-    df = av_fx_intraday(symbol, TF, outputsize="compact")
-
-    if len(df) < 220:
-        return None
+    df = td_time_series(symbol, TF, CANDLES)
 
     df["ema50"] = ema(df["close"], 50)
     df["ema200"] = ema(df["close"], 200)
     df["rsi14"] = rsi(df["close"], 14)
+    atrp = atr_pct_series(df, 14).iloc[-1]
+    atrp = float(atrp) if pd.notna(atrp) else 0.0
+
+    thr = ATR_THRESHOLD
+    if ADAPTIVE_FILTERS:
+        thr = adaptive_atr_threshold(df, ATR_THRESHOLD)
+
+    if atrp < thr:
+        return None
 
     close = float(df["close"].iloc[-1])
     ema50_v = float(df["ema50"].iloc[-1])
     ema200_v = float(df["ema200"].iloc[-1])
     rsi_v = float(df["rsi14"].iloc[-1])
-    atr_pct = atr_percent(df, 14)
-
-    # --- Adaptive ATR threshold (optional) ---
-    thr = ATR_THRESHOLD
-    if ADAPTIVE_FILTERS:
-        # берём медиану ATR% за последние 60 свечей и ставим порог ~70% от неё, но не ниже базового
-        recent = []
-        try:
-            a_series = atr(df, 14)
-            c_series = df["close"]
-            atrp = (a_series / c_series) * 100.0
-            recent = atrp.dropna().iloc[-60:].tolist()
-        except Exception:
-            recent = []
-
-        if recent:
-            med = float(np.median(recent))
-            thr = max(ATR_THRESHOLD, med * 0.70)
-
-    if atr_pct < thr:
-        return None
 
     trend_up = ema50_v > ema200_v
     trend_down = ema50_v < ema200_v
     if not (trend_up or trend_down):
         return None
 
+    # Скоринг (простая, стабильная логика)
     score = 0
     reasons = []
 
-    # Trend component
+    # тренд
     score += 35
-    reasons.append("EMA50 выше EMA200" if trend_up else "EMA50 ниже EMA200")
+    reasons.append("EMA50>EMA200" if trend_up else "EMA50<EMA200")
 
-    # RSI “impulse zone” (чуть мягче, чтобы чаще давал сигналы)
+    # RSI зоны — немного ослабили, чтобы чаще были сигналы
     direction = None
     if trend_up:
-        if 43 <= rsi_v <= 68:
+        if 42 <= rsi_v <= 68:
             score += 35
             direction = "CALL"
-            reasons.append("RSI подтверждает вверх")
-        else:
-            reasons.append("RSI не подтверждает вверх")
+            reasons.append("RSI ok for UP")
     else:
-        if 32 <= rsi_v <= 57:
+        if 32 <= rsi_v <= 58:
             score += 35
             direction = "PUT"
-            reasons.append("RSI подтверждает вниз")
-        else:
-            reasons.append("RSI не подтверждает вниз")
+            reasons.append("RSI ok for DOWN")
 
     if direction is None:
         return None
 
-    # Volatility bonus
-    vol_bonus = min(20, int((atr_pct / max(thr, 0.0001)) * 6))
-    score += vol_bonus
-    reasons.append(f"ATR(14) {atr_pct:.3f}% (thr {thr:.3f}%)")
+    # бонус за волатильность
+    if thr > 0:
+        vol_bonus = int(min(18, (atrp / thr) * 6))
+        score += vol_bonus
+        reasons.append(f"ATR {atrp:.3f}% (thr {thr:.3f}%)")
 
-    probability = int(max(55, min(92, score)))
-
-    entry = now_tz() + timedelta(seconds=ENTRY_DELAY_SECONDS)
+    probability = max(55, min(92, int(score)))
+    entry = now_tz()
     exit_ = entry + timedelta(minutes=EXPIRY_MINUTES)
-
+    sid = f"{entry.strftime('%Y%m%d%H%M%S')}_{symbol.replace('/','')}"
     return Signal(
         symbol=symbol,
         direction=direction,
@@ -315,49 +344,38 @@ def compute_signal(symbol: str) -> Optional[Signal]:
         rsi14=rsi_v,
         ema50=ema50_v,
         ema200=ema200_v,
-        atr14_pct=atr_pct,
+        atr14_pct=float(atrp),
         entry_time=entry,
         exit_time=exit_,
         reason=" | ".join(reasons),
+        id=sid,
     )
 
-def pick_signals(symbols: List[str]) -> List[Signal]:
-    out: List[Signal] = []
-    for sym in symbols:
+def pick_top_signals(symbols: List[str]) -> List[Signal]:
+    signals: List[Signal] = []
+    for s in symbols:
         try:
-            sig = compute_signal(sym)
-            if not sig:
-                continue
-            if sig.probability < MIN_PROBABILITY:
-                continue
-            out.append(sig)
-        except RuntimeError as e:
-            if str(e) == "API_LIMIT":
-                raise
-            log.warning("Signal error %s: %s", sym, e)
+            sig = compute_signal(s)
+            if sig:
+                signals.append(sig)
+        except TwelveLimitError:
+            raise
         except Exception as e:
-            log.warning("Signal error %s: %s", sym, e)
+            log.warning("Signal error for %s: %s", s, e)
 
-    out.sort(key=lambda s: s.probability, reverse=True)
-    return out
+    signals.sort(key=lambda x: x.probability, reverse=True)
+    if SEND_MODE == "BEST":
+        return signals[:1]
+    return signals[:TOP_N]
 
 # =========================
-# TELEGRAM MSGS
+# Telegram Messages
 # =========================
-def winloss_keyboard(signal_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ WIN", callback_data=f"wl|win|{signal_id}"),
-            InlineKeyboardButton("❌ LOSS", callback_data=f"wl|loss|{signal_id}"),
-        ]
-    ])
-
-def signal_text(sig: Signal) -> str:
-    dir_txt = direction_label(sig.direction)
-    arrow = "📈" if sig.direction == "CALL" else "📉"
+def signal_message(sig: Signal) -> str:
+    dir_text = direction_label(sig.direction)
     return (
-        f"📊 *СИГНАЛ {sig.symbol}* {arrow}\n"
-        f"📌 Направление: *{dir_txt}*\n"
+        f"📊 *СИГНАЛ {sig.symbol}*\n"
+        f"📈 Направление: *{dir_text}*\n"
         f"🔥 Вероятность: *{sig.probability}%*\n"
         f"⚡ ATR(14): `{sig.atr14_pct:.3f}%`\n\n"
         f"💰 Цена: `{sig.price:.5f}`\n"
@@ -366,26 +384,19 @@ def signal_text(sig: Signal) -> str:
         f"📍 EMA200: `{sig.ema200:.5f}`\n\n"
         f"⏱ Вход: *{fmt_time(sig.entry_time)}*\n"
         f"🏁 Выход: *{fmt_time(sig.exit_time)}*  (экспирация {EXPIRY_MINUTES} мин)\n"
-        f"🌍 Таймзона: `{TIMEZONE_NAME}`"
+        f"🌍 Таймзона: `{TIMEZONE_NAME}`\n"
+        f"🆔 id: `{sig.id}`"
     )
 
-def expiry_report_text(sig: Signal, outcome: Optional[str]) -> str:
-    # outcome: "win" | "loss" | None
-    wr = (STATS["win"] / max(1, STATS["win"] + STATS["loss"])) * 100.0
-    res_line = "⏳ Результат: *НЕ ОТМЕЧЕН*" if outcome is None else ("✅ Результат: *WIN*" if outcome == "win" else "❌ Результат: *LOSS*")
-    return (
-        f"📌 *ОТЧЁТ ПО СДЕЛКЕ*\n"
-        f"📊 Пара: *{sig.symbol}*\n"
-        f"📌 Направление: *{direction_label(sig.direction)}*\n"
-        f"{res_line}\n\n"
-        f"⏱ Вход: *{fmt_time(sig.entry_time)}*\n"
-        f"🏁 Выход: *{fmt_time(sig.exit_time)}*\n\n"
-        f"📈 Всего сигналов: *{STATS['signals']}*\n"
-        f"✅ WIN: *{STATS['win']}*   ❌ LOSS: *{STATS['loss']}*\n"
-        f"🎯 WinRate: *{wr:.1f}%*\n"
-    )
+def winloss_keyboard(signal_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ WIN", callback_data=f"wl|win|{signal_id}"),
+            InlineKeyboardButton("❌ LOSS", callback_data=f"wl|loss|{signal_id}"),
+        ]
+    ])
 
-async def post(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
+async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
     await context.bot.send_message(
         chat_id=CHANNEL_ID,
         text=text,
@@ -395,122 +406,176 @@ async def post(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None)
     )
 
 # =========================
-# AUTO REPORT JOB (after expiry)
+# Jobs
 # =========================
-async def job_trade_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def job_expiry_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data or {}
     signal_id = data.get("signal_id")
-    if not signal_id or signal_id not in SIGNALS:
+    symbol = data.get("symbol")
+    if not signal_id or not symbol:
         return
+    await post_to_channel(
+        context,
+        f"⏱ Экспирация прошла по *{symbol}*.\n"
+        f"Отметь результат кнопкой *WIN/LOSS* под сигналом.\n"
+        f"🆔 id: `{signal_id}`",
+        reply_markup=None
+    )
 
-    rec = SIGNALS[signal_id]
-    sig: Signal = rec["signal"]
-    outcome = rec.get("outcome")  # None/win/loss
-
-    # всегда отправляем авто-отчёт после экспирации
-    text = expiry_report_text(sig, outcome)
-
-    # если исход не отмечен — дать кнопки ещё раз
-    kb = winloss_keyboard(signal_id) if outcome is None else None
-    await post(context, text, reply_markup=kb)
-
-# =========================
-# JOB: SEND SIGNALS
-# =========================
 async def job_send_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LAST_NO_SIGNAL_NOTICE, LAST_API_LIMIT_NOTICE
+
     now = now_tz()
 
-    # cooldown filter (по символу)
+    # антиспам "рынок слабый" (не чаще чем раз в 20 мин)
+    def can_no_signal_notice() -> bool:
+        return (LAST_NO_SIGNAL_NOTICE is None) or ((now - LAST_NO_SIGNAL_NOTICE).total_seconds() > 20 * 60)
+
+    # антиспам "лимит API" (не чаще чем раз в 30 мин)
+    def can_api_notice() -> bool:
+        return (LAST_API_LIMIT_NOTICE is None) or ((now - LAST_API_LIMIT_NOTICE).total_seconds() > 30 * 60)
+
+    # фильтр кулдауна по символу: если недавно отправляли — не берем его
     symbols = []
     for s in SYMBOLS:
-        last = LAST_SENT.get(s)
+        last = LAST_SENT_BY_SYMBOL.get(s)
         if last and (now - last).total_seconds() < COOLDOWN_MINUTES * 60:
             continue
         symbols.append(s)
 
     if not symbols:
+        # нечего сканировать из-за кулдауна
         return
 
     try:
-        signals = pick_signals(symbols)
-    except RuntimeError as e:
-        if str(e) == "API_LIMIT":
-            await post(context, "⚠️ Данные временно недоступны (лимит API). Уменьши пары или увеличь интервал.")
-            return
-        raise
-
-    if not signals:
-        await post(context, "🟡 Рынок слабый: подходящих сигналов сейчас нет (фильтры/волатильность).")
+        top = pick_top_signals(symbols)
+    except TwelveLimitError:
+        if can_api_notice():
+            LAST_API_LIMIT_NOTICE = now
+            await post_to_channel(
+                context,
+                "⚠️ *Данные временно недоступны (лимит API).* \n"
+                "Я не молчу — просто TwelveData ограничил запросы.\n"
+                "✅ Решение: оставь *2 пары* и поставь интервал *10 минут*.\n"
+                "Например:\n"
+                "`SYMBOLS=EUR/USD,USD/JPY`\n"
+                "`SIGNAL_INTERVAL_SECONDS=600`"
+            )
         return
 
-    to_send: List[Signal]
-    if SEND_MODE == "ALL":
-        to_send = signals[:max(1, TOP_N)]
-    else:
-        # BEST (top N)
-        to_send = signals[:max(1, TOP_N)]
+    # если сигналов нет — не молчим, но и не спамим
+    if not top:
+        if can_no_signal_notice():
+            LAST_NO_SIGNAL_NOTICE = now
+            await post_to_channel(
+                context,
+                "📉 *Рынок слабый сейчас* — сильных совпадений нет.\n"
+                "Продолжаю анализ…"
+            )
+        return
 
-    for sig in to_send:
+    # отправляем сигналы
+    sent_any = False
+    for sig in top:
+        if sig.probability < MIN_PROBABILITY:
+            continue
+
         STATS["signals"] += 1
+        STATS["last_signal"] = {"id": sig.id, "symbol": sig.symbol, "ts": fmt_dt(sig.entry_time)}
+        LAST_SENT_BY_SYMBOL[sig.symbol] = now
 
-        signal_id = f"{sig.entry_time.strftime('%Y%m%d%H%M%S')}_{sig.symbol.replace('/','')}"
-        SIGNALS[signal_id] = {"signal": sig, "outcome": None, "created": fmt_dt(now)}
+        await post_to_channel(context, signal_message(sig), reply_markup=winloss_keyboard(sig.id))
+        sent_any = True
 
-        await post(context, signal_text(sig), reply_markup=winloss_keyboard(signal_id))
-        LAST_SENT[sig.symbol] = now
+        # авто-напоминание после экспирации
+        if context.job_queue:
+            context.job_queue.run_once(
+                job_expiry_reminder,
+                when=EXPIRY_MINUTES * 60,
+                data={"signal_id": sig.id, "symbol": sig.symbol},
+                name=f"expiry_{sig.id}",
+            )
 
-        # --- AUTO REPORT after expiry (+5 sec safety) ---
-        report_when = sig.exit_time + timedelta(seconds=5)
-        context.job_queue.run_once(
-            job_trade_report,
-            when=report_when,
-            data={"signal_id": signal_id},
-            name=f"trade_report_{signal_id}",
-        )
+    if not sent_any:
+        # если топ нашли, но ниже порога — мягко скажем (тоже с антиспамом)
+        if can_no_signal_notice():
+            LAST_NO_SIGNAL_NOTICE = now
+            await post_to_channel(
+                context,
+                "📉 Есть движения, но *качество ниже порога* — сигналы не отправляю.\n"
+                "Продолжаю анализ…"
+            )
 
-# =========================
-# JOB: PULSE
-# =========================
 async def job_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not STATS.get("pulse_on", True):
         return
-    await post(context, f"🕒 *{CHANNEL_NAME}*: бот жив, анализирую рынок…")
+    await post_to_channel(context, f"🕒 *{CHANNEL_NAME}*: бот жив, анализирую рынок…")
+
+async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    s = STATS["signals"]
+    w = STATS["win"]
+    l = STATS["loss"]
+    wr = (w / max(1, w + l)) * 100.0
+    txt = (
+        f"📌 *{CHANNEL_NAME} — ЕЖЕДНЕВНЫЙ ОТЧЁТ*\n"
+        f"🗓 Дата: *{now_tz().strftime('%d.%m.%Y')}*  ({TIMEZONE_NAME})\n\n"
+        f"📨 Сигналов: *{s}*\n"
+        f"✅ WIN: *{w}*\n"
+        f"❌ LOSS: *{l}*\n"
+        f"🎯 WinRate: *{wr:.1f}%*\n"
+    )
+    await post_to_channel(context, txt)
 
 # =========================
-# HANDLERS
+# Handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "✅ Бот активен.\n\n"
+        "✅ Бот активен.\n"
         f"Канал: {CHANNEL_NAME}\n"
+        f"Таймзона: {TIMEZONE_NAME}\n"
         f"Пары: {', '.join(SYMBOLS)}\n"
-        f"TF: {TF}\n"
-        f"TOP_N: {TOP_N} | SEND_MODE: {SEND_MODE}\n"
-        f"ADAPTIVE_FILTERS: {'ON' if ADAPTIVE_FILTERS else 'OFF'}\n"
-        f"Таймзона: {TIMEZONE_NAME}\n\n"
-        "Команды (только владелец):\n"
-        "/test /stats /pulse_on /pulse_off\n",
+        f"TOP_N={TOP_N}, SEND_MODE={SEND_MODE}\n"
+        f"ADAPTIVE_FILTERS={'ON' if ADAPTIVE_FILTERS else 'OFF'}\n\n"
+        "Команды (владелец):\n"
+        "/test — тест в канал\n"
+        "/stats — статистика\n"
+        "/pulse_on — включить пульс\n"
+        "/pulse_off — выключить пульс\n"
+        "/report_now — отчёт сейчас\n",
         disable_web_page_preview=True,
     )
 
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
-    await post(context, "✅ *ТЕСТ*: бот может писать в канал (OK)")
+    await post_to_channel(context, "✅ *ТЕСТ*: бот может писать в канал (OK)")
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
-    wr = (STATS["win"] / max(1, STATS["win"] + STATS["loss"])) * 100.0
+    s = STATS["signals"]
+    w = STATS["win"]
+    l = STATS["loss"]
+    wr = (w / max(1, w + l)) * 100.0
+    last = STATS.get("last_signal")
     await update.message.reply_text(
         f"📊 Статистика\n"
-        f"Сигналов: {STATS['signals']}\n"
-        f"WIN: {STATS['win']}\n"
-        f"LOSS: {STATS['loss']}\n"
+        f"Сигналов: {s}\n"
+        f"WIN: {w}\n"
+        f"LOSS: {l}\n"
         f"WinRate: {wr:.1f}%\n"
-        f"ADAPTIVE_FILTERS: {'ON' if ADAPTIVE_FILTERS else 'OFF'}\n"
-        f"TOP_N: {TOP_N} | SEND_MODE: {SEND_MODE}"
+        f"Последний: {last}\n"
+        f"Пары: {', '.join(SYMBOLS)}\n"
+        f"TOP_N={TOP_N}, SEND_MODE={SEND_MODE}\n"
+        f"ADAPTIVE_FILTERS={'ON' if ADAPTIVE_FILTERS else 'OFF'}\n"
     )
+
+async def report_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+    await job_daily_report(context)
+    await update.message.reply_text("✅ Отчёт отправлен в канал.")
 
 async def pulse_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
@@ -537,22 +602,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     action, signal_id = parts[1], parts[2]
-    if signal_id not in SIGNALS:
-        await q.message.reply_text("⚠️ Этот сигнал уже не найден (перезапуск бота).")
-        return
-
-    rec = SIGNALS[signal_id]
-    if rec.get("outcome") is not None:
-        await q.message.reply_text("ℹ️ Уже отмечено ранее.")
-        return
-
     if action == "win":
         STATS["win"] += 1
-        rec["outcome"] = "win"
         await q.message.reply_text(f"✅ WIN отмечен (id={signal_id})")
     elif action == "loss":
         STATS["loss"] += 1
-        rec["outcome"] = "loss"
         await q.message.reply_text(f"❌ LOSS отмечен (id={signal_id})")
 
 # =========================
@@ -568,19 +622,26 @@ def main() -> None:
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("pulse_on", pulse_on))
     app.add_handler(CommandHandler("pulse_off", pulse_off))
+    app.add_handler(CommandHandler("report_now", report_now))
     app.add_handler(CallbackQueryHandler(on_button))
 
     if app.job_queue is None:
         raise RuntimeError("JobQueue не активен. Установи python-telegram-bot[job-queue]==22.5")
 
-    # Signals loop
-    app.job_queue.run_repeating(job_send_signals, interval=SIGNAL_INTERVAL_SECONDS, first=10)
+    # Сигналы (TOP_N)
+    app.job_queue.run_repeating(job_send_signals, interval=SIGNAL_INTERVAL_SECONDS, first=10, name="signals")
 
-    # Pulse loop
-    app.job_queue.run_repeating(job_pulse, interval=PULSE_INTERVAL_SECONDS, first=60)
+    # Пульс
+    app.job_queue.run_repeating(job_pulse, interval=PULSE_INTERVAL_SECONDS, first=60, name="pulse")
 
-    log.info("IMPULS started | symbols=%s | TF=%s | interval=%ss | TOP_N=%s | SEND_MODE=%s | adaptive=%s",
-             SYMBOLS, TF, SIGNAL_INTERVAL_SECONDS, TOP_N, SEND_MODE, ADAPTIVE_FILTERS)
+    # Ежедневный отчет (по желанию)
+    report_t = time(hour=REPORT_HOUR, minute=REPORT_MINUTE, tzinfo=TZ)
+    app.job_queue.run_daily(job_daily_report, time=report_t, name="daily_report")
+
+    log.info(
+        "%s | started | TZ=%s | symbols=%s | interval=%ss | TOP_N=%d | SEND_MODE=%s | adaptive=%s",
+        CHANNEL_NAME, TIMEZONE_NAME, ",".join(SYMBOLS), SIGNAL_INTERVAL_SECONDS, TOP_N, SEND_MODE, ADAPTIVE_FILTERS
+    )
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
