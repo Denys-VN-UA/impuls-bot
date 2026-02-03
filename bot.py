@@ -528,10 +528,11 @@ async def job_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ЕЖЕДНЕВНЫЙ ОТЧЁТ (опционально)
 # =========================
 async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    s = STATS["signals"]
     w = STATS["win"]
     l = STATS["loss"]
-    s = STATS["signals"]
     wr = (w / max(1, w + l)) * 100.0
+
     txt = (
         f"📌 *{CHANNEL_NAME} — ЕЖЕДНЕВНЫЙ ОТЧЁТ*\n"
         f"🗓 Дата: *{now_tz().strftime('%d.%m.%Y')}*  ({TIMEZONE_NAME})\n\n"
@@ -541,6 +542,12 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🎯 WinRate: *{wr:.1f}%*\n"
     )
     await post_to_channel(context, txt)
+
+    # ✅ СБРОС статистики на новый день
+    STATS["signals"] = 0
+    STATS["win"] = 0
+    STATS["loss"] = 0
+    STATS["last_signal"] = None
 
 # =========================
 # HANDLERS
