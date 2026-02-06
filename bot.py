@@ -1,6 +1,7 @@
 # bot.py
-# IMPULS ⚡ FINAL v2 — TwelveData, TOP-N, no-spam weak market, trading schedule, auto expiry report (no ID shown)
-# python-telegram-bot[job-queue]==22.5
+# IMPULS ⚡ FINAL v3 — TwelveData, TOP-N, "не молчит", график ПН–ПТ 10:00–20:00,
+# HYBRID (3/5 мин авто), адаптивный ATR, авто-отчёт после экспирации (без ID внизу)
+# Требует: python-telegram-bot[job-queue]==22.5
 
 import os
 import logging
@@ -11,7 +12,7 @@ import numpy as np
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
-from typing import Optional, Any, List, Dict, Tuple
+from typing import Optional, Any, List, Dict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -23,54 +24,64 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()           # -100xxxx или @username
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 CHANNEL_NAME = os.getenv("CHANNEL_NAME", "IMPULS ⚡")
 
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Kyiv")
 TZ = ZoneInfo(TIMEZONE_NAME)
 
-# Торговые дни/время (ПН–ПТ 10:00–20:00)
-TRADE_START = os.getenv("TRADE_START", "10:00").strip()  # HH:MM
-TRADE_END = os.getenv("TRADE_END", "20:00").strip()      # HH:MM
+# Торговые дни/время (ПН–ПТ)
+TRADE_START = os.getenv("TRADE_START", "10:00").strip()
+TRADE_END = os.getenv("TRADE_END", "20:00").strip()
 
 # Сканер
 SYMBOLS = [x.strip() for x in os.getenv("SYMBOLS", "EUR/USD,USD/JPY,USD/CHF").split(",") if x.strip()]
-SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "600"))  # 10 минут по дефолту (экономит лимит)
+SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "600"))  # дефолт 10 минут
 TF = os.getenv("TF", "1min")
 CANDLES = int(os.getenv("CANDLES", "250"))
 
-EXPIRY_MINUTES = int(os.getenv("EXPIRY_MINUTES", "3"))
-
-# Фильтры
-MIN_PROBABILITY = int(os.getenv("MIN_PROBABILITY", "58"))
-ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.012"))  # ATR% порог (в процентах)
-ADAPTIVE_FILTERS = os.getenv("ADAPTIVE_FILTERS", "1").strip() in ("1", "true", "True", "YES", "yes")
-GLOBAL_ATR_MULT = float(os.getenv("GLOBAL_ATR_MULT", "1.00"))
-
-# Старший тренд
-TREND_FILTER = os.getenv("TREND_FILTER", "1").strip() in ("1", "true", "True", "YES", "yes")
-TREND_TF = os.getenv("TREND_TF", "15min").strip()  # 15min по умолчанию (экономно и полезно)
-
 # Отправка сигналов
 SEND_MODE = os.getenv("SEND_MODE", "TOP").strip().upper()  # TOP / BEST / ALL
-TOP_N = int(os.getenv("TOP_N", "2"))
+TOP_N = int(os.getenv("TOP_N", "1"))                       # 1..3
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "8")) # не долбить одну пару
 
-# Кулдаун на одну пару (чтобы не долбить один символ)
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "6"))
+# Фильтры качества
+MIN_PROBABILITY = int(os.getenv("MIN_PROBABILITY", "60"))
+ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.010"))  # ATR% базовый
+ADAPTIVE_FILTERS = os.getenv("ADAPTIVE_FILTERS", "1").strip().lower() in ("1", "true", "yes")
+GLOBAL_ATR_MULT = float(os.getenv("GLOBAL_ATR_MULT", "0.90"))
 
-# Ограничители спама “рынок слабый / не торговое время / лимит API”
+# Старший тренд (для качества можно включить, но будет меньше сигналов)
+TREND_FILTER = os.getenv("TREND_FILTER", "0").strip().lower() in ("1", "true", "yes")
+TREND_TF = os.getenv("TREND_TF", "15min").strip()
+
+# “Не молчать” — сообщения с кулдауном
 WEAK_MSG_COOLDOWN_MINUTES = int(os.getenv("WEAK_MSG_COOLDOWN_MINUTES", "45"))
 OFFTIME_MSG_COOLDOWN_MINUTES = int(os.getenv("OFFTIME_MSG_COOLDOWN_MINUTES", "60"))
 APILIMIT_MSG_COOLDOWN_MINUTES = int(os.getenv("APILIMIT_MSG_COOLDOWN_MINUTES", "60"))
 
-# Пульс (сообщение “бот жив”)
+# Пульс
 PULSE_INTERVAL_SECONDS = int(os.getenv("PULSE_INTERVAL_SECONDS", "1800"))  # 30 минут
-PULSE_ENABLED = os.getenv("PULSE_ENABLED", "1").strip() in ("1", "true", "True", "YES", "yes")
+PULSE_ENABLED = os.getenv("PULSE_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 
-# Ежедневный отчёт (по умолчанию 20:05 в таймзоне)
+# Ежедневный отчёт (по умолчанию после конца сессии)
 REPORT_HOUR = int(os.getenv("REPORT_HOUR", "20"))
 REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "5"))
+
+# =========================
+# HYBRID (3/5 мин авто)
+# =========================
+# Если HYBRID_MODE=1:
+# - при высокой волатильности (ATR% >= HYBRID_ATR_BORDER) даём EXPIRY_FAST (обычно 3 мин)
+# - при низкой/средней воле даём EXPIRY_SLOW (обычно 5 мин)
+HYBRID_MODE = os.getenv("HYBRID_MODE", "1").strip().lower() in ("1", "true", "yes")
+HYBRID_ATR_BORDER = float(os.getenv("HYBRID_ATR_BORDER", "0.018"))
+EXPIRY_FAST = int(os.getenv("EXPIRY_FAST", "3"))
+EXPIRY_SLOW = int(os.getenv("EXPIRY_SLOW", "5"))
+
+# Если HYBRID_MODE=0 — используем EXPIRY_MINUTES как раньше
+EXPIRY_MINUTES = int(os.getenv("EXPIRY_MINUTES", "3"))
 
 
 # =========================
@@ -87,13 +98,13 @@ log = logging.getLogger("impuls")
 # СТАТИСТИКА (в памяти, сброс по дню)
 # =========================
 STATS: Dict[str, Any] = {
-    "day": None,  # YYYY-MM-DD (TZ)
+    "day": None,
     "signals": 0,
     "win": 0,
     "loss": 0,
     "last_signal": None,
     "pulse_on": True,
-    "cooldown": {},  # symbol -> iso timestamp
+    "cooldown": {},  # symbol -> iso
     "last_weak_msg": None,
     "last_oftime_msg": None,
     "last_api_msg": None,
@@ -117,7 +128,6 @@ def ensure_day_reset() -> None:
         STATS["win"] = 0
         STATS["loss"] = 0
         STATS["last_signal"] = None
-        # cooldown можно оставить, но логичнее обнулить в начале дня:
         STATS["cooldown"] = {}
         log.info("Daily stats reset for %s (%s)", d, TIMEZONE_NAME)
 
@@ -138,24 +148,6 @@ def is_trading_time(dt: datetime) -> bool:
     t = dt.timetz()
     return (t >= start_t) and (t <= end_t)
 
-def direction_label(direction: str) -> str:
-    return "⬆️ ВВЕРХ" if direction.upper() == "CALL" else "⬇️ ВНИЗ"
-
-def arrow_only(direction: str) -> str:
-    return "⬆️" if direction.upper() == "CALL" else "⬇️"
-
-def sign_dir_from_prices(entry: float, last: float) -> str:
-    if last > entry:
-        return "⬆️ ВВЕРХ"
-    if last < entry:
-        return "⬇️ ВНИЗ"
-    return "➡️ РОВНО"
-
-def pct_change(entry: float, last: float) -> float:
-    if entry == 0:
-        return 0.0
-    return ((last - entry) / entry) * 100.0
-
 def minutes_ago(ts_iso: Optional[str]) -> Optional[float]:
     if not ts_iso:
         return None
@@ -172,6 +164,21 @@ def can_send_throttled(key: str, cooldown_minutes: int) -> bool:
         STATS[key] = now_tz().isoformat()
         return True
     return False
+
+def direction_label(direction: str) -> str:
+    return "⬆️ ВВЕРХ" if direction.upper() == "CALL" else "⬇️ ВНИЗ"
+
+def sign_dir_from_prices(entry: float, last: float) -> str:
+    if last > entry:
+        return "⬆️ ВВЕРХ"
+    if last < entry:
+        return "⬇️ ВНИЗ"
+    return "➡️ РОВНО"
+
+def pct_change(entry: float, last: float) -> float:
+    if entry == 0:
+        return 0.0
+    return ((last - entry) / entry) * 100.0
 
 
 # =========================
@@ -271,8 +278,8 @@ def atr_percent(df: pd.DataFrame, period: int = 14) -> float:
 
 def adaptive_atr_threshold(df: pd.DataFrame) -> float:
     """
-    Адаптивный порог: берём медиану ATR% за последние ~60 свечей и умножаем.
-    Это помогает не “молчать” в спокойный день и не лезть в шум в бурный день.
+    Адаптивный порог: медиана ATR% за последние 60 свечей.
+    Порог = max(ATR_THRESHOLD, 0.80*median) * GLOBAL_ATR_MULT
     """
     base = ATR_THRESHOLD
     if not ADAPTIVE_FILTERS:
@@ -286,7 +293,6 @@ def adaptive_atr_threshold(df: pd.DataFrame) -> float:
         if len(tail) < 20:
             return max(0.0, base) * GLOBAL_ATR_MULT
         med = float(tail.median())
-        # порог = максимум из (base) и (0.80*медианы)
         thr = max(base, 0.80 * med) * GLOBAL_ATR_MULT
         return float(thr)
     except Exception:
@@ -299,7 +305,7 @@ def adaptive_atr_threshold(df: pd.DataFrame) -> float:
 @dataclass
 class Signal:
     symbol: str
-    direction: str  # CALL/PUT
+    direction: str          # CALL/PUT
     probability: int
     price: float
     rsi14: float
@@ -308,14 +314,10 @@ class Signal:
     atr14_pct: float
     entry_time: datetime
     exit_time: datetime
-    # для авто-отчёта
     entry_price: float
+    expiry_minutes: int
 
 def trend_ok(symbol: str) -> Optional[str]:
-    """
-    Старший тренд (TREND_TF):
-    CALL если EMA50 > EMA200, PUT если EMA50 < EMA200.
-    """
     if not TREND_FILTER:
         return None
     df = td_time_series(symbol, TREND_TF, 220)
@@ -328,6 +330,12 @@ def trend_ok(symbol: str) -> Optional[str]:
     if e50 < e200:
         return "PUT"
     return None
+
+def choose_expiry_minutes(atrp: float) -> int:
+    if not HYBRID_MODE:
+        return EXPIRY_MINUTES
+    # Высокая вола → 3 мин, спокойнее → 5 мин
+    return EXPIRY_FAST if atrp >= HYBRID_ATR_BORDER else EXPIRY_SLOW
 
 def compute_signal(symbol: str) -> Optional[Signal]:
     df = td_time_series(symbol, TF, CANDLES)
@@ -346,22 +354,20 @@ def compute_signal(symbol: str) -> Optional[Signal]:
     if atrp < thr:
         return None
 
-    # локальный тренд
     trend_up = ema50_v > ema200_v
     trend_down = ema50_v < ema200_v
 
     direction = None
     score = 0
 
+    # RSI зоны для коротких экспираций
     if trend_up:
         score += 35
-        # для CALL лучше средний RSI (без перекупленности)
         if 45 <= rsi_v <= 65:
             score += 35
             direction = "CALL"
     elif trend_down:
         score += 35
-        # для PUT лучше средний RSI (без перепроданности)
         if 35 <= rsi_v <= 55:
             score += 35
             direction = "PUT"
@@ -371,19 +377,14 @@ def compute_signal(symbol: str) -> Optional[Signal]:
     if direction is None:
         return None
 
-    # старший тренд — либо совпадает (бонус), либо не совпадает (бан)
     if TREND_FILTER:
         tdir = trend_ok(symbol)
-        if tdir is None:
-            # если не смогли определить — нейтрально
-            pass
-        elif tdir == direction:
-            score += 12
-        else:
+        if tdir is not None and tdir != direction:
             return None
+        if tdir == direction:
+            score += 12
 
-    # бонус за волу (чем выше ATR% относительно порога — тем лучше)
-    # но ограничиваем, чтобы не улетало в 99%
+    # бонус за волу относительно порога
     rel = atrp / max(thr, 0.0001)
     vol_bonus = min(20, int(rel * 6))
     score += vol_bonus
@@ -392,8 +393,10 @@ def compute_signal(symbol: str) -> Optional[Signal]:
     if probability < MIN_PROBABILITY:
         return None
 
+    expiry_min = choose_expiry_minutes(atrp)
+
     entry = now_tz()
-    exit_ = entry + timedelta(minutes=EXPIRY_MINUTES)
+    exit_ = entry + timedelta(minutes=expiry_min)
 
     return Signal(
         symbol=symbol,
@@ -407,6 +410,7 @@ def compute_signal(symbol: str) -> Optional[Signal]:
         entry_time=entry,
         exit_time=exit_,
         entry_price=close,
+        expiry_minutes=expiry_min,
     )
 
 def in_cooldown(symbol: str) -> bool:
@@ -433,30 +437,29 @@ def pick_signals(symbols: List[str]) -> List[Signal]:
     if not found:
         return []
 
-    mode = SEND_MODE
-    if mode == "ALL":
+    if SEND_MODE == "ALL":
         return found
-    if mode == "BEST":
+    if SEND_MODE == "BEST":
         return found[:1]
+
     # TOP
-    return found[:max(1, min(3, TOP_N))]
+    n = max(1, min(3, TOP_N))
+    return found[:n]
 
 
 # =========================
 # TELEGRAM: сообщения
 # =========================
-def winloss_keyboard(signal_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ WIN", callback_data=f"wl|win|{signal_id}"),
-            InlineKeyboardButton("❌ LOSS", callback_data=f"wl|loss|{signal_id}"),
-        ]
-    ])
+def winloss_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ WIN", callback_data="wl|win"),
+        InlineKeyboardButton("❌ LOSS", callback_data="wl|loss"),
+    ]])
 
 def signal_message(sig: Signal) -> str:
-    # стиль “Pocket Option” (короче и аккуратнее)
+    hybrid_tag = " (HYBRID)" if HYBRID_MODE else ""
     return (
-        f"📊 *СИГНАЛ {sig.symbol}*  📈\n"
+        f"📊 *СИГНАЛ {sig.symbol}*{hybrid_tag}\n"
         f"🎯 Направление: *{direction_label(sig.direction)}*\n"
         f"🔥 Вероятность: *{sig.probability}%*\n\n"
         f"💰 Цена: `{sig.price:.5f}`\n"
@@ -465,8 +468,8 @@ def signal_message(sig: Signal) -> str:
         f"📍 EMA50: `{sig.ema50:.5f}`\n"
         f"📍 EMA200: `{sig.ema200:.5f}`\n\n"
         f"⏱ Вход: *{fmt_time(sig.entry_time)}*\n"
-        f"🏁 Выход: *{fmt_time(sig.exit_time)}*  (эксп. {EXPIRY_MINUTES} мин)\n"
-        f"🌍 Таймзона: `{TIMEZONE_NAME}`"
+        f"🏁 Выход: *{fmt_time(sig.exit_time)}*  (эксп. {sig.expiry_minutes} мин)\n"
+        f"🌍 `{TIMEZONE_NAME}`"
     )
 
 def offtime_message() -> str:
@@ -477,16 +480,13 @@ def offtime_message() -> str:
     )
 
 def weak_market_message() -> str:
-    return (
-        "📉 Рынок слабый — сильных сигналов нет.\n"
-        "Я продолжаю анализировать…"
-    )
+    return "📉 Рынок слабый — сильных сигналов нет.\nЯ продолжаю анализировать…"
 
 def api_limit_message() -> str:
     return (
         "⚠️ Данные временно недоступны (лимит API).\n"
         "Я не молчу — просто провайдер ограничил запросы.\n"
-        "Попробуй позже или уменьши частоту/список пар."
+        "Уменьши частоту или список пар."
     )
 
 async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
@@ -500,36 +500,33 @@ async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str, reply_m
 
 
 # =========================
-# AUTO EXPIRY REPORT
+# AUTO EXPIRY REPORT (без ID)
 # =========================
 async def job_expiry_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data or {}
     symbol = data["symbol"]
     direction = data["direction"]
     entry_price = float(data["entry_price"])
+    expiry_minutes = int(data["expiry_minutes"])
 
-    # получаем актуальную цену (дёшево: /price)
     try:
         last_price = td_price(symbol)
     except Exception as e:
         log.warning("Expiry price fetch failed for %s: %s", symbol, e)
-        # не спамим — просто промолчим (это отчёт, не сигнал)
         return
 
     move_label = sign_dir_from_prices(entry_price, last_price)
     delta = pct_change(entry_price, last_price)
     delta_str = f"{delta:+.3f}%"
 
-    # результат “по котировкам”
     quote_win = (last_price > entry_price) if direction.upper() == "CALL" else (last_price < entry_price)
     quote_result = "✅ WIN" if quote_win else "❌ LOSS"
 
-    # аккуратный отчёт БЕЗ строки ID (как ты просил)
     text = (
-        f"⏱ Экспирация прошла по *{symbol}*\n"
+        f"⏱ Экспирация *{expiry_minutes} мин* прошла по *{symbol}*\n"
         f"📈 График пошёл: *{move_label}*\n"
         f"💰 Цена: `{entry_price:.5f}` → `{last_price:.5f}`  ({delta_str})\n"
-        f"✅ По котировкам это *{quote_result}*\n\n"
+        f"✅ По котировкам: *{quote_result}*\n\n"
         f"👉 Если у Pocket Option итог отличается — отметь вручную WIN/LOSS под сигналом."
     )
     await post_to_channel(context, text)
@@ -549,12 +546,11 @@ async def job_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
             await post_to_channel(context, offtime_message())
         return
 
-    # пытаемся найти сигналы
+    # ищем сигналы
     try:
         signals = pick_signals(SYMBOLS)
     except Exception as e:
         msg = str(e).lower()
-        # лимит/кредиты/429
         if ("credit" in msg) or ("limit" in msg) or ("429" in msg) or ("too many" in msg):
             if can_send_throttled("last_api_msg", APILIMIT_MSG_COOLDOWN_MINUTES):
                 await post_to_channel(context, api_limit_message())
@@ -570,16 +566,13 @@ async def job_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
     # отправляем 1–3 лучших
     for sig in signals:
         STATS["signals"] += 1
+        STATS["last_signal"] = {"symbol": sig.symbol, "time": sig.entry_time.isoformat(), "prob": sig.probability}
         mark_cooldown(sig.symbol)
 
-        # signal_id нужен ТОЛЬКО для кнопок (в тексте не выводим)
-        signal_id = f"{sig.entry_time.strftime('%Y%m%d%H%M%S')}_{sig.symbol.replace('/', '')}"
-        STATS["last_signal"] = {"symbol": sig.symbol, "time": sig.entry_time.isoformat(), "prob": sig.probability}
+        await post_to_channel(context, signal_message(sig), reply_markup=winloss_keyboard())
 
-        await post_to_channel(context, signal_message(sig), reply_markup=winloss_keyboard(signal_id))
-
-        # авто-отчёт по экспирации (через EXPIRY_MINUTES + 2 сек)
-        delay = EXPIRY_MINUTES * 60 + 2
+        # авто-отчёт после экспирации
+        delay = sig.expiry_minutes * 60 + 2
         context.job_queue.run_once(
             job_expiry_report,
             when=delay,
@@ -587,8 +580,9 @@ async def job_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "symbol": sig.symbol,
                 "direction": sig.direction,
                 "entry_price": sig.entry_price,
+                "expiry_minutes": sig.expiry_minutes,
             },
-            name=f"expiry_{signal_id}",
+            name=f"expiry_{sig.symbol}_{sig.entry_time.strftime('%H%M%S')}",
         )
 
 async def job_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -596,7 +590,6 @@ async def job_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not STATS.get("pulse_on", True):
         return
-    # не спамим ночью: пульс только в торговое время
     if not is_trading_time(now_tz()):
         return
     await post_to_channel(context, f"🕒 *{CHANNEL_NAME}*: бот жив, анализирую рынок…")
@@ -609,7 +602,7 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     wr = (w / max(1, w + l)) * 100.0
 
     txt = (
-        f"📌 *{CHANNEL_NAME} — ЕЖЕДНЕВНЫЙ ОТЧЁТ*\n"
+        f"📌 *{CHANNEL_NAME} — ОТЧЁТ ЗА ДЕНЬ*\n"
         f"🗓 Дата: *{now_tz().strftime('%d.%m.%Y')}*  ({TIMEZONE_NAME})\n\n"
         f"✉️ Сигналов: *{s}*\n"
         f"✅ WIN: *{w}*\n"
@@ -620,17 +613,18 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================
-# HANDLERS
+# HANDLERS (команды)
 # =========================
 def is_owner(user_id: int) -> bool:
     return OWNER_ID != 0 and user_id == OWNER_ID
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "✅ IMPULS запущен.\n\n"
+        "✅ IMPULS v3 запущен.\n\n"
         f"Канал: {CHANNEL_NAME}\n"
         f"Таймзона: {TIMEZONE_NAME}\n"
-        f"Торговля: ПН–ПТ {TRADE_START}–{TRADE_END}\n\n"
+        f"Торговля: ПН–ПТ {TRADE_START}–{TRADE_END}\n"
+        f"Режим: {'HYBRID 3/5' if HYBRID_MODE else f'{EXPIRY_MINUTES} мин'}\n\n"
         "Команды (владелец):\n"
         "/test\n/stats\n/report_now\n/pulse_on\n/pulse_off\n",
         disable_web_page_preview=True,
@@ -686,12 +680,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     data = (q.data or "").split("|")
-    if len(data) != 3 or data[0] != "wl":
+    if len(data) != 2 or data[0] != "wl":
         return
 
     ensure_day_reset()
     action = data[1]
-
     if action == "win":
         STATS["win"] += 1
         await q.message.reply_text("✅ WIN отмечен")
@@ -720,23 +713,21 @@ def main() -> None:
     if app.job_queue is None:
         raise RuntimeError("JobQueue не активен. Убедись, что установлен python-telegram-bot[job-queue]==22.5")
 
-    # Сигналы (сканер)
     app.job_queue.run_repeating(job_signals, interval=SIGNAL_INTERVAL_SECONDS, first=10, name="signals")
-
-    # Пульс
     app.job_queue.run_repeating(job_pulse, interval=PULSE_INTERVAL_SECONDS, first=60, name="pulse")
 
-    # Ежедневный отчёт (по TZ)
     report_t = time(hour=REPORT_HOUR, minute=REPORT_MINUTE, tzinfo=TZ)
     app.job_queue.run_daily(job_daily_report, time=report_t, name="daily_report")
 
     log.info(
-        "IMPULS started | TZ=%s | Trade=%s-%s | Symbols=%s | Mode=%s TOP_N=%s | TF=%s TrendTF=%s Trend=%s | ATR=%s adaptive=%s",
-        TIMEZONE_NAME, TRADE_START, TRADE_END, SYMBOLS, SEND_MODE, TOP_N, TF, TREND_TF, TREND_FILTER,
-        ATR_THRESHOLD, ADAPTIVE_FILTERS
+        "IMPULS v3 started | TZ=%s | Trade=%s-%s | Symbols=%s | Mode=%s TOP_N=%s | HYBRID=%s border=%s fast=%s slow=%s | TF=%s Trend=%s(%s) | ATR=%s adaptive=%s mult=%s | MIN_PROB=%s",
+        TIMEZONE_NAME, TRADE_START, TRADE_END, SYMBOLS, SEND_MODE, TOP_N,
+        HYBRID_MODE, HYBRID_ATR_BORDER, EXPIRY_FAST, EXPIRY_SLOW,
+        TF, TREND_FILTER, TREND_TF, ATR_THRESHOLD, ADAPTIVE_FILTERS, GLOBAL_ATR_MULT, MIN_PROBABILITY
     )
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
