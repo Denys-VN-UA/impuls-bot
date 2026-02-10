@@ -1,10 +1,10 @@
 # bot.py
-# IMPULS ⚡ V3.1 — FIX "бот молчит" (async-safe), TwelveData, TOP-N, schedule, auto expiry report (no ID)
+# IMPULS ⚡ FINAL v3.1 — TwelveData, TOP-N, no-spam weak market, trading schedule,
+# auto expiry report (no ID shown), + /diag diagnostics + /whoami
 # python-telegram-bot[job-queue]==22.5
 
 import os
 import logging
-import asyncio
 import requests
 import pandas as pd
 import numpy as np
@@ -31,21 +31,22 @@ CHANNEL_NAME = os.getenv("CHANNEL_NAME", "IMPULS ⚡")
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Kyiv")
 TZ = ZoneInfo(TIMEZONE_NAME)
 
-# ПН–ПТ 10:00–20:00
-TRADE_START = os.getenv("TRADE_START", "10:00").strip()
-TRADE_END = os.getenv("TRADE_END", "20:00").strip()
+# Торговые дни/время (ПН–ПТ 10:00–20:00)
+TRADE_START = os.getenv("TRADE_START", "10:00").strip()  # HH:MM
+TRADE_END = os.getenv("TRADE_END", "20:00").strip()      # HH:MM
 
 # Сканер
 SYMBOLS = [x.strip() for x in os.getenv("SYMBOLS", "EUR/USD,USD/JPY,USD/CHF").split(",") if x.strip()]
 SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "600"))
-TF = os.getenv("TF", "1min")
+TF = os.getenv("TF", "1min").strip()
 CANDLES = int(os.getenv("CANDLES", "250"))
 
+# Экспирация (минуты)
 EXPIRY_MINUTES = int(os.getenv("EXPIRY_MINUTES", "3"))
 
 # Фильтры
 MIN_PROBABILITY = int(os.getenv("MIN_PROBABILITY", "58"))
-ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.012"))  # ATR% порог
+ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.012"))  # ATR% порог (в процентах)
 ADAPTIVE_FILTERS = os.getenv("ADAPTIVE_FILTERS", "1").strip() in ("1", "true", "True", "YES", "yes")
 GLOBAL_ATR_MULT = float(os.getenv("GLOBAL_ATR_MULT", "1.00"))
 
@@ -53,19 +54,23 @@ GLOBAL_ATR_MULT = float(os.getenv("GLOBAL_ATR_MULT", "1.00"))
 TREND_FILTER = os.getenv("TREND_FILTER", "1").strip() in ("1", "true", "True", "YES", "yes")
 TREND_TF = os.getenv("TREND_TF", "15min").strip()
 
-# Отправка
-SEND_MODE = os.getenv("SEND_MODE", "TOP").strip().upper()  # TOP/BEST/ALL
+# Отправка сигналов
+SEND_MODE = os.getenv("SEND_MODE", "TOP").strip().upper()  # TOP / BEST / ALL
 TOP_N = int(os.getenv("TOP_N", "2"))
 
+# Кулдаун на одну пару
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "6"))
 
+# Ограничители спама “рынок слабый / не торговое время / лимит API”
 WEAK_MSG_COOLDOWN_MINUTES = int(os.getenv("WEAK_MSG_COOLDOWN_MINUTES", "45"))
 OFFTIME_MSG_COOLDOWN_MINUTES = int(os.getenv("OFFTIME_MSG_COOLDOWN_MINUTES", "60"))
 APILIMIT_MSG_COOLDOWN_MINUTES = int(os.getenv("APILIMIT_MSG_COOLDOWN_MINUTES", "60"))
 
+# Пульс (сообщение “бот жив”)
 PULSE_INTERVAL_SECONDS = int(os.getenv("PULSE_INTERVAL_SECONDS", "1800"))
 PULSE_ENABLED = os.getenv("PULSE_ENABLED", "1").strip() in ("1", "true", "True", "YES", "yes")
 
+# Ежедневный отчёт (по умолчанию 20:05 в таймзоне)
 REPORT_HOUR = int(os.getenv("REPORT_HOUR", "20"))
 REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "5"))
 
@@ -73,32 +78,32 @@ REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "5"))
 # =========================
 # ЛОГИ
 # =========================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("impuls")
 
 
 # =========================
-# СТАТИСТИКА
+# СТАТИСТИКА (в памяти)
 # =========================
 STATS: Dict[str, Any] = {
-    "day": None,
+    "day": None,  # YYYY-MM-DD (TZ)
     "signals": 0,
     "win": 0,
     "loss": 0,
     "last_signal": None,
     "pulse_on": True,
-    "cooldown": {},
+    "cooldown": {},  # symbol -> iso timestamp
     "last_weak_msg": None,
     "last_oftime_msg": None,
     "last_api_msg": None,
 }
 
-# чтобы job_signals не запускался параллельно сам с собой
-SCAN_LOCK = asyncio.Lock()
-
 
 # =========================
-# ВРЕМЯ
+# УТИЛИТЫ ВРЕМЕНИ
 # =========================
 def now_tz() -> datetime:
     return datetime.now(TZ)
@@ -125,13 +130,28 @@ def parse_hhmm(s: str) -> time:
     return time(hour=int(hh), minute=int(mm), tzinfo=TZ)
 
 def is_trading_time(dt: datetime) -> bool:
-    wd = dt.weekday()
+    wd = dt.weekday()  # ПН=0 ... ВС=6
     if wd >= 5:
         return False
     start_t = parse_hhmm(TRADE_START)
     end_t = parse_hhmm(TRADE_END)
     t = dt.timetz()
     return (t >= start_t) and (t <= end_t)
+
+def direction_label(direction: str) -> str:
+    return "⬆️ ВВЕРХ" if direction.upper() == "CALL" else "⬇️ ВНИЗ"
+
+def sign_dir_from_prices(entry: float, last: float) -> str:
+    if last > entry:
+        return "⬆️ ВВЕРХ"
+    if last < entry:
+        return "⬇️ ВНИЗ"
+    return "➡️ РОВНО"
+
+def pct_change(entry: float, last: float) -> float:
+    if entry == 0:
+        return 0.0
+    return ((last - entry) / entry) * 100.0
 
 def minutes_ago(ts_iso: Optional[str]) -> Optional[float]:
     if not ts_iso:
@@ -156,21 +176,21 @@ def can_send_throttled(key: str, cooldown_minutes: int) -> bool:
 # =========================
 def require_env() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN пустой.")
+        raise RuntimeError("BOT_TOKEN пустой. Добавь BOT_TOKEN в Railway Variables.")
     if not TWELVE_API_KEY:
-        raise RuntimeError("TWELVE_API_KEY пустой.")
+        raise RuntimeError("TWELVE_API_KEY пустой. Добавь TWELVE_API_KEY в Railway Variables.")
     if not CHANNEL_ID:
-        raise RuntimeError("CHANNEL_ID пустой.")
+        raise RuntimeError("CHANNEL_ID пустой. Добавь CHANNEL_ID в Railway Variables.")
     if OWNER_ID == 0:
-        log.warning("OWNER_ID не задан (0). Owner-команды будут игнорироваться.")
+        log.warning("OWNER_ID не задан (0). Команды owner-only и WIN/LOSS недоступны.")
 
 
 # =========================
-# TWELVEDATA (SYNC) + ASYNC WRAPPERS
+# TWELVEDATA
 # =========================
 TD_BASE = "https://api.twelvedata.com"
 
-def td_time_series_sync(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
+def td_time_series(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
     url = f"{TD_BASE}/time_series"
     params = {
         "symbol": symbol,
@@ -200,25 +220,17 @@ def td_time_series_sync(symbol: str, interval: str, outputsize: int) -> pd.DataF
     df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
     return df
 
-def td_price_sync(symbol: str) -> float:
+def td_price(symbol: str) -> float:
     url = f"{TD_BASE}/price"
     params = {"symbol": symbol, "apikey": TWELVE_API_KEY, "format": "JSON"}
     r = requests.get(url, params=params, timeout=15)
     data = r.json()
-
     if isinstance(data, dict) and data.get("status") == "error":
         raise RuntimeError(data.get("message") or "TwelveData price error")
-
     p = data.get("price")
     if p is None:
         raise RuntimeError("No price returned")
     return float(p)
-
-async def td_time_series(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
-    return await asyncio.to_thread(td_time_series_sync, symbol, interval, outputsize)
-
-async def td_price(symbol: str) -> float:
-    return await asyncio.to_thread(td_price_sync, symbol)
 
 
 # =========================
@@ -241,7 +253,10 @@ def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low = df["low"]
     close = df["close"]
     prev_close = close.shift(1)
-    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1
+    ).max(axis=1)
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def atr_percent(df: pd.DataFrame, period: int = 14) -> float:
@@ -255,6 +270,7 @@ def adaptive_atr_threshold(df: pd.DataFrame) -> float:
     base = ATR_THRESHOLD
     if not ADAPTIVE_FILTERS:
         return max(0.0, base) * GLOBAL_ATR_MULT
+
     try:
         a = atr_series(df, 14)
         c = df["close"]
@@ -270,12 +286,12 @@ def adaptive_atr_threshold(df: pd.DataFrame) -> float:
 
 
 # =========================
-# SIGNAL LOGIC
+# ЛОГИКА СИГНАЛА
 # =========================
 @dataclass
 class Signal:
     symbol: str
-    direction: str
+    direction: str  # CALL/PUT
     probability: int
     price: float
     rsi14: float
@@ -286,25 +302,10 @@ class Signal:
     exit_time: datetime
     entry_price: float
 
-def direction_label(direction: str) -> str:
-    return "⬆️ ВВЕРХ" if direction.upper() == "CALL" else "⬇️ ВНИЗ"
-
-def sign_dir_from_prices(entry: float, last: float) -> str:
-    if last > entry:
-        return "⬆️ ВВЕРХ"
-    if last < entry:
-        return "⬇️ ВНИЗ"
-    return "➡️ РОВНО"
-
-def pct_change(entry: float, last: float) -> float:
-    if entry == 0:
-        return 0.0
-    return ((last - entry) / entry) * 100.0
-
-async def trend_ok(symbol: str) -> Optional[str]:
+def trend_ok(symbol: str) -> Optional[str]:
     if not TREND_FILTER:
         return None
-    df = await td_time_series(symbol, TREND_TF, 220)
+    df = td_time_series(symbol, TREND_TF, 220)
     df["ema50"] = ema(df["close"], 50)
     df["ema200"] = ema(df["close"], 200)
     e50 = float(df["ema50"].iloc[-1])
@@ -315,8 +316,8 @@ async def trend_ok(symbol: str) -> Optional[str]:
         return "PUT"
     return None
 
-async def compute_signal(symbol: str) -> Optional[Signal]:
-    df = await td_time_series(symbol, TF, CANDLES)
+def compute_signal(symbol: str) -> Optional[Signal]:
+    df = td_time_series(symbol, TF, CANDLES)
 
     df["ema50"] = ema(df["close"], 50)
     df["ema200"] = ema(df["close"], 200)
@@ -355,14 +356,15 @@ async def compute_signal(symbol: str) -> Optional[Signal]:
         return None
 
     if TREND_FILTER:
-        tdir = await trend_ok(symbol)
+        tdir = trend_ok(symbol)
         if tdir is not None and tdir != direction:
             return None
         if tdir == direction:
             score += 12
 
     rel = atrp / max(thr, 0.0001)
-    score += min(20, int(rel * 6))
+    vol_bonus = min(20, int(rel * 6))
+    score += vol_bonus
 
     probability = max(55, min(92, int(score)))
     if probability < MIN_PROBABILITY:
@@ -395,12 +397,12 @@ def in_cooldown(symbol: str) -> bool:
 def mark_cooldown(symbol: str) -> None:
     STATS["cooldown"][symbol] = now_tz().isoformat()
 
-async def pick_signals(symbols: List[str]) -> List[Signal]:
+def pick_signals(symbols: List[str]) -> List[Signal]:
     found: List[Signal] = []
     for s in symbols:
         if in_cooldown(s):
             continue
-        sig = await compute_signal(s)
+        sig = compute_signal(s)
         if sig:
             found.append(sig)
 
@@ -417,12 +419,14 @@ async def pick_signals(symbols: List[str]) -> List[Signal]:
 
 
 # =========================
-# TELEGRAM
+# TELEGRAM: сообщения
 # =========================
 def winloss_keyboard(signal_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ WIN", callback_data=f"wl|win|{signal_id}"),
-         InlineKeyboardButton("❌ LOSS", callback_data=f"wl|loss|{signal_id}")]
+        [
+            InlineKeyboardButton("✅ WIN", callback_data=f"wl|win|{signal_id}"),
+            InlineKeyboardButton("❌ LOSS", callback_data=f"wl|loss|{signal_id}"),
+        ]
     ])
 
 def signal_message(sig: Signal) -> str:
@@ -441,15 +445,21 @@ def signal_message(sig: Signal) -> str:
     )
 
 def offtime_message() -> str:
-    return f"🌙 Сейчас не торговое время.\n📅 Торгую ПН–ПТ\n⏰ {TRADE_START}–{TRADE_END} ({TIMEZONE_NAME})"
+    return (
+        f"🌙 Сейчас не торговое время.\n"
+        f"📅 Торгую ПН–ПТ\n"
+        f"⏰ {TRADE_START}–{TRADE_END} ({TIMEZONE_NAME})"
+    )
 
 def weak_market_message() -> str:
     return "📉 Рынок слабый — сильных сигналов нет.\nЯ продолжаю анализировать…"
 
 def api_limit_message() -> str:
-    return ("⚠️ Данные временно недоступны (лимит API).\n"
-            "Я не молчу — провайдер ограничил запросы.\n"
-            "Попробуй позже или уменьши частоту/список пар.")
+    return (
+        "⚠️ Данные временно недоступны (лимит API).\n"
+        "Я не молчу — просто провайдер ограничил запросы.\n"
+        "Попробуй позже или уменьши частоту/список пар."
+    )
 
 async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
     await context.bot.send_message(
@@ -471,7 +481,7 @@ async def job_expiry_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     entry_price = float(data["entry_price"])
 
     try:
-        last_price = await td_price(symbol)
+        last_price = td_price(symbol)
     except Exception as e:
         log.warning("Expiry price fetch failed for %s: %s", symbol, e)
         return
@@ -498,51 +508,45 @@ async def job_expiry_report(context: ContextTypes.DEFAULT_TYPE) -> None:
 # =========================
 async def job_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
     ensure_day_reset()
+    now = now_tz()
 
-    # НЕ даём запускаться параллельно
-    if SCAN_LOCK.locked():
+    if not is_trading_time(now):
+        if can_send_throttled("last_oftime_msg", OFFTIME_MSG_COOLDOWN_MINUTES):
+            await post_to_channel(context, offtime_message())
         return
 
-    async with SCAN_LOCK:
-        now = now_tz()
-
-        if not is_trading_time(now):
-            if can_send_throttled("last_oftime_msg", OFFTIME_MSG_COOLDOWN_MINUTES):
-                await post_to_channel(context, offtime_message())
+    try:
+        signals = pick_signals(SYMBOLS)
+    except Exception as e:
+        msg = str(e).lower()
+        if ("credit" in msg) or ("limit" in msg) or ("429" in msg) or ("too many" in msg):
+            if can_send_throttled("last_api_msg", APILIMIT_MSG_COOLDOWN_MINUTES):
+                await post_to_channel(context, api_limit_message())
             return
+        log.exception("Signal scan error: %s", e)
+        return
 
-        try:
-            signals = await pick_signals(SYMBOLS)
-        except Exception as e:
-            msg = str(e).lower()
-            if ("credit" in msg) or ("limit" in msg) or ("429" in msg) or ("too many" in msg):
-                if can_send_throttled("last_api_msg", APILIMIT_MSG_COOLDOWN_MINUTES):
-                    await post_to_channel(context, api_limit_message())
-                return
-            log.exception("Signal scan error: %s", e)
-            return
+    if not signals:
+        if can_send_throttled("last_weak_msg", WEAK_MSG_COOLDOWN_MINUTES):
+            await post_to_channel(context, weak_market_message())
+        return
 
-        if not signals:
-            if can_send_throttled("last_weak_msg", WEAK_MSG_COOLDOWN_MINUTES):
-                await post_to_channel(context, weak_market_message())
-            return
+    for sig in signals:
+        STATS["signals"] += 1
+        mark_cooldown(sig.symbol)
 
-        for sig in signals:
-            STATS["signals"] += 1
-            mark_cooldown(sig.symbol)
+        signal_id = f"{sig.entry_time.strftime('%Y%m%d%H%M%S')}_{sig.symbol.replace('/', '')}"
+        STATS["last_signal"] = {"symbol": sig.symbol, "time": sig.entry_time.isoformat(), "prob": sig.probability}
 
-            signal_id = f"{sig.entry_time.strftime('%Y%m%d%H%M%S')}_{sig.symbol.replace('/', '')}"
-            STATS["last_signal"] = {"symbol": sig.symbol, "time": sig.entry_time.isoformat(), "prob": sig.probability}
+        await post_to_channel(context, signal_message(sig), reply_markup=winloss_keyboard(signal_id))
 
-            await post_to_channel(context, signal_message(sig), reply_markup=winloss_keyboard(signal_id))
-
-            delay = EXPIRY_MINUTES * 60 + 2
-            context.job_queue.run_once(
-                job_expiry_report,
-                when=delay,
-                data={"symbol": sig.symbol, "direction": sig.direction, "entry_price": sig.entry_price},
-                name=f"expiry_{signal_id}",
-            )
+        delay = EXPIRY_MINUTES * 60 + 2
+        context.job_queue.run_once(
+            job_expiry_report,
+            when=delay,
+            data={"symbol": sig.symbol, "direction": sig.direction, "entry_price": sig.entry_price},
+            name=f"expiry_{signal_id}",
+        )
 
 async def job_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not PULSE_ENABLED:
@@ -572,24 +576,129 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # =========================
+# DIAG (V3.1)
+# =========================
+def _bool_emoji(v: bool) -> str:
+    return "✅" if v else "❌"
+
+def _trend_local(ema50_v: float, ema200_v: float) -> str:
+    if ema50_v > ema200_v:
+        return "UP"
+    if ema50_v < ema200_v:
+        return "DOWN"
+    return "FLAT"
+
+def diag_symbol(symbol: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"symbol": symbol}
+    out["cooldown"] = in_cooldown(symbol)
+
+    df = td_time_series(symbol, TF, CANDLES)
+    df["ema50"] = ema(df["close"], 50)
+    df["ema200"] = ema(df["close"], 200)
+    df["rsi14"] = rsi(df["close"], 14)
+
+    close = float(df["close"].iloc[-1])
+    ema50_v = float(df["ema50"].iloc[-1])
+    ema200_v = float(df["ema200"].iloc[-1])
+    rsi_v = float(df["rsi14"].iloc[-1])
+    atrp = atr_percent(df, 14)
+    thr = adaptive_atr_threshold(df)
+
+    out.update({
+        "price": close,
+        "ema50": ema50_v,
+        "ema200": ema200_v,
+        "rsi": rsi_v,
+        "atrp": atrp,
+        "thr": thr,
+        "local_trend": _trend_local(ema50_v, ema200_v),
+    })
+
+    # Правила, как в compute_signal
+    reasons = []
+
+    atr_ok = atrp >= thr
+    if not atr_ok:
+        reasons.append(f"ATR low ({atrp:.3f}% < {thr:.3f}%)")
+
+    trend_up = ema50_v > ema200_v
+    trend_down = ema50_v < ema200_v
+    if not (trend_up or trend_down):
+        reasons.append("EMA trend flat")
+
+    # RSI окна
+    candidate_dir = None
+    rsi_ok = False
+    if trend_up:
+        candidate_dir = "CALL"
+        rsi_ok = (45 <= rsi_v <= 65)
+        if not rsi_ok:
+            reasons.append(f"RSI out for CALL ({rsi_v:.1f} not in 45-65)")
+    elif trend_down:
+        candidate_dir = "PUT"
+        rsi_ok = (35 <= rsi_v <= 55)
+        if not rsi_ok:
+            reasons.append(f"RSI out for PUT ({rsi_v:.1f} not in 35-55)")
+
+    # Старший тренд
+    trend_tf_ok = True
+    tdir = None
+    if TREND_FILTER:
+        tdir = trend_ok(symbol)
+        if tdir is not None and candidate_dir is not None and tdir != candidate_dir:
+            trend_tf_ok = False
+            reasons.append(f"TrendTF mismatch ({TREND_TF} says {tdir}, local {candidate_dir})")
+
+    # Score/prob как в compute_signal (приблизительно)
+    score = 0
+    if trend_up or trend_down:
+        score += 35
+    if rsi_ok:
+        score += 35
+    if TREND_FILTER and tdir is not None and tdir == candidate_dir:
+        score += 12
+    if atr_ok:
+        rel = atrp / max(thr, 0.0001)
+        score += min(20, int(rel * 6))
+    probability = max(55, min(92, int(score)))
+
+    prob_ok = probability >= MIN_PROBABILITY
+    if not prob_ok:
+        reasons.append(f"prob low ({probability}% < {MIN_PROBABILITY}%)")
+
+    pass_all = (not out["cooldown"]) and atr_ok and (trend_up or trend_down) and rsi_ok and trend_tf_ok and prob_ok
+
+    out.update({
+        "candidate": candidate_dir,
+        "prob": probability,
+        "pass": pass_all,
+        "reasons": reasons,
+    })
+    return out
+
+
+# =========================
 # HANDLERS
 # =========================
 def is_owner(user_id: int) -> bool:
-    return OWNER_ID != 0 and user_id == OWNER_ID
+    return OWNER_ID != 0 and int(user_id) == int(OWNER_ID)
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "✅ IMPULS запущен.\n\n"
+        f"Канал: {CHANNEL_NAME}\n"
         f"Таймзона: {TIMEZONE_NAME}\n"
         f"Торговля: ПН–ПТ {TRADE_START}–{TRADE_END}\n"
-        f"Пары: {', '.join(SYMBOLS)}\n"
-        f"Экспирация: {EXPIRY_MINUTES} мин\n\n"
-        "Owner-команды:\n/test /stats /report_now /pulse_on /pulse_off /ping",
+        f"TF: {TF}\n"
+        f"Expiry: {EXPIRY_MINUTES} мин\n\n"
+        "Команды (владелец):\n"
+        "/test\n/stats\n/report_now\n/pulse_on\n/pulse_off\n/diag\n/whoami\n",
         disable_web_page_preview=True,
     )
 
-async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🏓 PONG")
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id if update.effective_user else None
+    await update.message.reply_text(f"👤 Your user_id: `{uid}`\nOWNER_ID in env: `{OWNER_ID}`", parse_mode=ParseMode.MARKDOWN)
 
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
@@ -605,7 +714,15 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     w = STATS["win"]
     l = STATS["loss"]
     wr = (w / max(1, w + l)) * 100.0
-    await update.message.reply_text(f"📊 Сегодня: {w}W/{l}L, сигналов={s}, WR={wr:.1f}%")
+    last = STATS.get("last_signal")
+    await update.message.reply_text(
+        f"📊 Статистика (за сегодня)\n"
+        f"Сигналов: {s}\n"
+        f"WIN: {w}\n"
+        f"LOSS: {l}\n"
+        f"WinRate: {wr:.1f}%\n"
+        f"Последний: {last if last else '—'}"
+    )
 
 async def report_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
@@ -624,6 +741,59 @@ async def pulse_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     STATS["pulse_on"] = False
     await update.message.reply_text("✅ Пульс выключён.")
+
+async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        return
+
+    ensure_day_reset()
+    now = now_tz()
+    header = (
+        f"🧪 DIAG (V3.1)\n"
+        f"Now: {now.strftime('%d.%m %H:%M:%S')} ({TIMEZONE_NAME})\n"
+        f"TradingTime: {_bool_emoji(is_trading_time(now))}\n"
+        f"TF={TF}  TrendFilter={int(TREND_FILTER)}({TREND_TF})\n"
+        f"MIN_PROB={MIN_PROBABILITY}  ATR_BASE={ATR_THRESHOLD}  ADAPT={int(ADAPTIVE_FILTERS)}  ATR_MULT={GLOBAL_ATR_MULT}\n"
+        f"TOP_N={TOP_N}  COOLDOWN={COOLDOWN_MINUTES}m\n"
+        f"Symbols: {', '.join(SYMBOLS)}\n"
+        "—"
+    )
+    await update.message.reply_text(f"```text\n{header}\n```", parse_mode=ParseMode.MARKDOWN)
+
+    lines: List[str] = []
+    for s in SYMBOLS:
+        try:
+            d = diag_symbol(s)
+            status = "PASS ✅" if d["pass"] else "REJECT ❌"
+            cd = "CD ✅" if d["cooldown"] else "CD —"
+            cand = d["candidate"] or "—"
+            reason = "; ".join(d["reasons"]) if d["reasons"] else "ok"
+            line = (
+                f"{s:10} | {status:9} | {cd:4} | cand={cand:4} | "
+                f"prob={d['prob']:>2}% | ATR={d['atrp']:.3f}% thr={d['thr']:.3f}% | "
+                f"RSI={d['rsi']:.1f} | EMAtrend={d['local_trend']} | {reason}"
+            )
+            lines.append(line)
+        except Exception as e:
+            lines.append(f"{s:10} | ERROR ❌ | {e}")
+
+    # отправляем кусками (чтобы Telegram не резал)
+    chunk = []
+    size = 0
+    for ln in lines:
+        if size + len(ln) + 1 > 3500:
+            await update.message.reply_text("```text\n" + "\n".join(chunk) + "\n```", parse_mode=ParseMode.MARKDOWN)
+            chunk, size = [], 0
+        chunk.append(ln)
+        size += len(ln) + 1
+    if chunk:
+        await update.message.reply_text("```text\n" + "\n".join(chunk) + "\n```", parse_mode=ParseMode.MARKDOWN)
+
+    await update.message.reply_text(
+        "Если везде REJECT из-за `ATR low` — снизь ATR_THRESHOLD или GLOBAL_ATR_MULT.\n"
+        "Если из-за `RSI out` — расширим окна RSI.\n"
+        "Скинь сюда результат /diag — я скажу точные правки под твой рынок."
+    )
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -646,9 +816,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         STATS["loss"] += 1
         await q.message.reply_text("❌ LOSS отмечен")
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("ERROR: %s", context.error)
-
 
 # =========================
 # MAIN
@@ -658,19 +825,19 @@ def main() -> None:
     ensure_day_reset()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("whoami", whoami_cmd))
     app.add_handler(CommandHandler("test", test_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("report_now", report_now_cmd))
     app.add_handler(CommandHandler("pulse_on", pulse_on_cmd))
     app.add_handler(CommandHandler("pulse_off", pulse_off_cmd))
+    app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
 
     if app.job_queue is None:
-        raise RuntimeError("JobQueue не активен. Нужен python-telegram-bot[job-queue]==22.5")
+        raise RuntimeError("JobQueue не активен. Убедись, что установлен python-telegram-bot[job-queue]==22.5")
 
     app.job_queue.run_repeating(job_signals, interval=SIGNAL_INTERVAL_SECONDS, first=10, name="signals")
     app.job_queue.run_repeating(job_pulse, interval=PULSE_INTERVAL_SECONDS, first=60, name="pulse")
@@ -678,10 +845,13 @@ def main() -> None:
     report_t = time(hour=REPORT_HOUR, minute=REPORT_MINUTE, tzinfo=TZ)
     app.job_queue.run_daily(job_daily_report, time=report_t, name="daily_report")
 
-    log.info("IMPULS started OK | bot=%s", CHANNEL_NAME)
+    log.info(
+        "IMPULS v3.1 started | TZ=%s | Trade=%s-%s | Symbols=%s | Mode=%s TOP_N=%s | TF=%s TrendTF=%s Trend=%s | ATR=%s adaptive=%s | expiry=%sm",
+        TIMEZONE_NAME, TRADE_START, TRADE_END, SYMBOLS, SEND_MODE, TOP_N, TF, TREND_TF, TREND_FILTER,
+        ATR_THRESHOLD, ADAPTIVE_FILTERS, EXPIRY_MINUTES
+    )
 
-    # важно: сбросить “старые” апдейты, чтобы не зависнуть на очереди
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
