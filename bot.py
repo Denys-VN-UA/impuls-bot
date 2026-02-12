@@ -473,20 +473,18 @@ def winloss_keyboard() -> InlineKeyboardMarkup:
     ])
 
 def signal_message(sig: Signal) -> str:
-    # короткий стиль “Pocket Option”
     exp = sig.expiry_minutes
+
+    arrow = "⬆️ВВЕРХ" if sig.direction == "CALL" else "⬇️ВНИЗ"
+
     return (
-        f"📊 *СИГНАЛ {sig.symbol}*\n"
-        f"🎯 Направление: *{direction_label(sig.direction)}*\n"
-        f"🔥 Вероятность: *{sig.probability}%*\n"
-        f"⏳ Экспирация: *{exp} мин*\n\n"
-        f"💰 Цена: `{sig.price:.5f}`\n"
-        f"⚡ ATR(14): `{sig.atr14_pct:.3f}%`\n"
-        f"📉 RSI(14): `{sig.rsi14:.1f}`\n"
-        f"📍 EMA50/200: `{sig.ema50:.5f}` / `{sig.ema200:.5f}`\n\n"
-        f"⏱ Вход: *{fmt_time(sig.entry_time)}*\n"
-        f"🏁 Выход: *{fmt_time(sig.exit_time)}*\n"
-        f"🌍 `{TIMEZONE_NAME}`"
+        f"📊 СИГНАЛ {sig.symbol}\n"
+        f"🎯 Направление: {arrow}\n"
+        f"🔥 Вероятность: {sig.probability}%\n"
+        f"⌛️ Экспирация: {exp} мин\n\n"
+        f"⏱ Вход: {fmt_time(sig.entry_time)}\n"
+        f"🏁 Выход: {fmt_time(sig.exit_time)}\n"
+        f"🌍 {TIMEZONE_NAME}"
     )
 
 def offtime_message() -> str:
