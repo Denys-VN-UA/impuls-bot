@@ -474,19 +474,18 @@ def winloss_keyboard() -> InlineKeyboardMarkup:
 
 def signal_message(sig: Signal) -> str:
     exp = sig.expiry_minutes
-
-    arrow = "⬆️ВВЕРХ" if sig.direction == "CALL" else "⬇️ВНИЗ"
+    # стрелка + слово как ты хочешь
+    dir_text = "⬆️ ВВЕРХ" if sig.direction.upper() == "CALL" else "⬇️ ВНИЗ"
 
     return (
-        f"📊 СИГНАЛ {sig.symbol}\n"
-        f"🎯 Направление: {arrow}\n"
-        f"🔥 Вероятность: {sig.probability}%\n"
-        f"⌛️ Экспирация: {exp} мин\n\n"
-        f"⏱ Вход: {fmt_time(sig.entry_time)}\n"
-        f"🏁 Выход: {fmt_time(sig.exit_time)}\n"
-        f"🌍 {TIMEZONE_NAME}"
+        f"📊 *СИГНАЛ {sig.symbol}*\n"
+        f"🎯Направление: *{dir_text}*\n"
+        f"🔥 Вероятность: *{sig.probability}%*\n"
+        f"⌛️Экспирация: *{exp} мин*\n\n"
+        f"⏱ Вход: *{fmt_time(sig.entry_time)}*\n"
+        f"🏁 Выход: *{fmt_time(sig.exit_time)}*\n"
+        f"🌍 *{TIMEZONE_NAME}*"
     )
-
 def offtime_message() -> str:
     return (
         f"🌙 Сейчас не торговое время.\n"
