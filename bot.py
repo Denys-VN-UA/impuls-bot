@@ -489,7 +489,7 @@ def signal_message(sig: Signal) -> str:
         f"⌛️ <b>Экспирация:</b> {sig.expiry_minutes} мин\n\n"
         f"⏱ <b>Вход:</b> {fmt_time(sig.entry_time)}\n"
         f"🏁 <b>Выход:</b> {fmt_time(sig.exit_time)}\n"
-        f"🌍 <b>{TIMEZONE_NAME}</b>"
+        f"🌍 <b>{TIMEZONE_NAME.replace('Europe/', '')}</b>"
     )
 
 def expiry_message(symbol: str, expiry_minutes: int, direction: str, entry_price: float, last_price: float) -> str:
