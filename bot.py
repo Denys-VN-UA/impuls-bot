@@ -1,9 +1,11 @@
-# bot.py
-# IMPULS ⚡ FINAL v4.1 — TwelveData, TOP-N, анти-спам, торговый график, авто-отчёт по экспирации (HTML), умный гибрид 3/5м с упором на качество
+# bot_FINAL_v4.py
+# IMPULS ⚡ FINAL v4 — TwelveData, TOP-N, hybrid expiry (3m/5m), early-break, anti-spam, trading schedule,
+# async-safe (no event-loop blocking), auto expiry report, owner-only controls
 # python-telegram-bot[job-queue]==22.5
 
 import os
 import logging
+import asyncio
 import requests
 import pandas as pd
 import numpy as np
@@ -11,7 +13,7 @@ import numpy as np
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -24,62 +26,88 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-CHANNEL_NAME = os.getenv("CHANNEL_NAME", "IMPULS ⚡")
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+CHANNEL_NAME = os.getenv("CHANNEL_NAME", "IMPULS ⚡").strip()
 
-# Ты в Берлине → дефолт сразу Berlin
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Berlin")
+TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Kyiv").strip()
 TZ = ZoneInfo(TIMEZONE_NAME)
 
-# Торговые дни/время (ПН–ПТ 10:00–20:00)
+# Торговые дни/время (ПН–ПТ)
 TRADE_START = os.getenv("TRADE_START", "10:00").strip()  # HH:MM
 TRADE_END = os.getenv("TRADE_END", "20:00").strip()      # HH:MM
 
 # Сканер
-SYMBOLS = [x.strip() for x in os.getenv("SYMBOLS", "EUR/USD,GBP/USD,USD/JPY,USD/CHF,EUR/JPY").split(",") if x.strip()]
-SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "720"))  # 12 минут по умолчанию (меньше шансов словить лимит)
-TF = os.getenv("TF", "1min")
+SIGNAL_INTERVAL_SECONDS = int(os.getenv("SIGNAL_INTERVAL_SECONDS", "720"))  # 12 минут по умолчанию
+TF = os.getenv("TF", "1min").strip()
 CANDLES = int(os.getenv("CANDLES", "250"))
 
-# Экспирации
-EXPIRY_FAST_MIN = int(os.getenv("EXPIRY_FAST_MIN", "3"))
-EXPIRY_SLOW_MIN = int(os.getenv("EXPIRY_SLOW_MIN", "5"))
-# Если нужно принудительно: FORCE_EXPIRY_MIN=3 (или 5). 0/пусто = авто.
-FORCE_EXPIRY_MIN = int(os.getenv("FORCE_EXPIRY_MIN", "0"))
-
-# Фильтры качества
-MIN_PROBABILITY = int(os.getenv("MIN_PROBABILITY", "70"))
-HYBRID_MIN_PROB = int(os.getenv("HYBRID_MIN_PROB", "78"))
-ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.010"))  # ATR% порог (в процентах)
-ADAPTIVE_FILTERS = os.getenv("ADAPTIVE_FILTERS", "1").strip().lower() in ("1", "true", "yes")
-GLOBAL_ATR_MULT = float(os.getenv("GLOBAL_ATR_MULT", "1.00"))
-
-# Упор на качество: 1 = сильнее тянем к 3м и режем шум
-QUALITY_MODE = os.getenv("QUALITY_MODE", "1").strip().lower() in ("1", "true", "yes")
-
-# Старший тренд
-TREND_FILTER = os.getenv("TREND_FILTER", "1").strip().lower() in ("1", "true", "yes")
-TREND_TF = os.getenv("TREND_TF", "15min").strip()
-
-# Отправка сигналов
 SEND_MODE = os.getenv("SEND_MODE", "TOP").strip().upper()  # TOP / BEST / ALL
 TOP_N = int(os.getenv("TOP_N", "1"))
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "7"))
 
-# Кулдаун на пару (чтобы не долбить один символ)
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "10"))
+# PRO-адаптация (можно включать/выключать через Railway Variables)
+QUALITY_MODE = int(os.getenv("QUALITY_MODE", "0"))  # 1 = строгие фильтры (меньше сигналов, выше качество)
+ADAPTIVE_PRO_MAX = int(os.getenv("ADAPTIVE_PRO_MAX", "0"))  # 1 = авто-адаптация порогов под рынок
+DIVERSIFY_WINDOW_MINUTES = int(os.getenv("DIVERSIFY_WINDOW_MINUTES", "25"))  # не спамить одну пару
+DIVERSIFY_PENALTY_POINTS = float(os.getenv("DIVERSIFY_PENALTY_POINTS", "5"))  # штраф к вероятности (в п.п.)
 
-# Ограничители спама
+
+# Фильтры качества
+MIN_PROBABILITY = int(os.getenv("MIN_PROBABILITY", "52"))
+
+ATR_THRESHOLD = float(os.getenv("ATR_THRESHOLD", "0.006"))   # ATR% базовый порог
+ADAPTIVE_FILTERS = os.getenv("ADAPTIVE_FILTERS", "1").strip() in ("1", "true", "True", "YES", "yes")
+GLOBAL_ATR_MULT = float(os.getenv("GLOBAL_ATR_MULT", "0.95"))
+
+TREND_FILTER = os.getenv("TREND_FILTER", "0").strip() in ("1", "true", "True", "YES", "yes")
+TREND_TF = os.getenv("TREND_TF", "15min").strip()
+
+# HYBRID expiry (3m/5m)
+HYBRID_MODE = os.getenv("HYBRID_MODE", "1").strip() in ("1", "true", "True", "YES", "yes")
+EXPIRY_MINUTES = int(os.getenv("EXPIRY_MINUTES", "3"))  # базово (если гибрид выключен)
+EXPIRY_FAST = int(os.getenv("EXPIRY_FAST", "3"))        # короткая экспирация
+EXPIRY_SLOW = int(os.getenv("EXPIRY_SLOW", "5"))        # длинная экспирация
+HYBRID_ATR_BORDER = float(os.getenv("HYBRID_ATR_BORDER", "0.014"))  # ATR% граница: выше = быстрее
+HYBRID_CHOP_THRESHOLD = float(os.getenv("HYBRID_CHOP_THRESHOLD", "61"))  # чем выше, тем более "пила" -> длиннее
+HYBRID_IMPULSE_CUTOFF = float(os.getenv("HYBRID_IMPULSE_CUTOFF", "1.15"))  # импульс: выше -> быстрее
+HYBRID_MIN_PROB = int(os.getenv("HYBRID_MIN_PROB", str(MIN_PROBABILITY)))
+
+# EARLY BREAK (экономит лимит API): если нашли достаточно сильный сигнал — не сканим остальные пары
+EARLY_BREAK = os.getenv("EARLY_BREAK", "1").strip() in ("1", "true", "True", "YES", "yes")
+EARLY_BREAK_PROB = int(os.getenv("EARLY_BREAK_PROB", "78"))
+TREND_CHECK_TOP_K = int(os.getenv("TREND_CHECK_TOP_K", "0"))  # 0 = не применять (оставлено для совместимости)
+
+# Анти-спам сообщений
 WEAK_MSG_COOLDOWN_MINUTES = int(os.getenv("WEAK_MSG_COOLDOWN_MINUTES", "45"))
 OFFTIME_MSG_COOLDOWN_MINUTES = int(os.getenv("OFFTIME_MSG_COOLDOWN_MINUTES", "60"))
 APILIMIT_MSG_COOLDOWN_MINUTES = int(os.getenv("APILIMIT_MSG_COOLDOWN_MINUTES", "60"))
 
 # Пульс
-PULSE_INTERVAL_SECONDS = int(os.getenv("PULSE_INTERVAL_SECONDS", "1800"))
-PULSE_ENABLED = os.getenv("PULSE_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+PULSE_ENABLED = os.getenv("PULSE_ENABLED", "1").strip() in ("1", "true", "True", "YES", "yes")
+PULSE_INTERVAL_SECONDS = int(os.getenv("PULSE_INTERVAL_SECONDS", "1800"))  # 30 минут
 
-# Ежедневный отчёт
+# Ежедневный отчёт (по умолчанию 20:05)
 REPORT_HOUR = int(os.getenv("REPORT_HOUR", "20"))
 REPORT_MINUTE = int(os.getenv("REPORT_MINUTE", "5"))
+
+# Пары
+def _parse_symbols(raw: str) -> List[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        raw = "EUR/USD,GBP/USD,USD/JPY,USD/CHF,EUR/JPY"
+    # частая ошибка: вставляют "SYMBOLS=EUR/USD,..." прямо в value
+    raw = raw.replace("SYMBOLS=", "").replace("symbols=", "")
+    # иногда разделяют через | или ;
+    raw = raw.replace("|", ",").replace(";", ",")
+    out = []
+    for x in raw.split(","):
+        s = x.strip()
+        if not s:
+            continue
+        out.append(s)
+    return out
+
+SYMBOLS = _parse_symbols(os.getenv("SYMBOLS", ""))
 
 
 # =========================
@@ -93,7 +121,7 @@ log = logging.getLogger("impuls")
 
 
 # =========================
-# СТАТИСТИКА (в памяти, сброс по дню)
+# СТАТИСТИКА (в памяти)
 # =========================
 STATS: Dict[str, Any] = {
     "day": None,
@@ -102,7 +130,7 @@ STATS: Dict[str, Any] = {
     "loss": 0,
     "last_signal": None,
     "pulse_on": True,
-    "cooldown": {},
+    "cooldown": {},  # symbol -> iso ts
     "last_weak_msg": None,
     "last_oftime_msg": None,
     "last_api_msg": None,
@@ -110,7 +138,7 @@ STATS: Dict[str, Any] = {
 
 
 # =========================
-# УТИЛИТЫ ВРЕМЕНИ
+# ВРЕМЯ
 # =========================
 def now_tz() -> datetime:
     return datetime.now(TZ)
@@ -137,7 +165,7 @@ def parse_hhmm(s: str) -> time:
     return time(hour=int(hh), minute=int(mm), tzinfo=TZ)
 
 def is_trading_time(dt: datetime) -> bool:
-    wd = dt.weekday()  # ПН=0 ... ВС=6
+    wd = dt.weekday()  # 0..6
     if wd >= 5:
         return False
     start_t = parse_hhmm(TRADE_START)
@@ -163,43 +191,26 @@ def can_send_throttled(key: str, cooldown_minutes: int) -> bool:
     return False
 
 
-def direction_label(direction: str) -> str:
-    return "⬆️ ВВЕРХ" if direction.upper() == "CALL" else "⬇️ ВНИЗ"
-
-def sign_dir_from_prices(entry: float, last: float) -> str:
-    if last > entry:
-        return "⬆️ ВВЕРХ"
-    if last < entry:
-        return "⬇️ ВНИЗ"
-    return "➡️ РОВНО"
-
-
-def pct_change(entry: float, last: float) -> float:
-    if entry == 0:
-        return 0.0
-    return ((last - entry) / entry) * 100.0
-
-
 # =========================
 # REQUIRE ENV
 # =========================
 def require_env() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN пустой. Добавь BOT_TOKEN в Railway Variables.")
+        raise RuntimeError("BOT_TOKEN пустой. Добавь BOT_TOKEN в Variables.")
     if not TWELVE_API_KEY:
-        raise RuntimeError("TWELVE_API_KEY пустой. Добавь TWELVE_API_KEY в Railway Variables.")
+        raise RuntimeError("TWELVE_API_KEY пустой. Добавь TWELVE_API_KEY в Variables.")
     if not CHANNEL_ID:
-        raise RuntimeError("CHANNEL_ID пустой. Добавь CHANNEL_ID в Railway Variables.")
+        raise RuntimeError("CHANNEL_ID пустой. Добавь CHANNEL_ID в Variables.")
     if OWNER_ID == 0:
-        log.warning("OWNER_ID не задан (0). Команды owner-only и WIN/LOSS недоступны.")
+        log.warning("OWNER_ID не задан (0). Owner-команды будут недоступны.")
 
 
 # =========================
-# TWELVEDATA
+# TWELVEDATA (SYNC) — будет вызываться через asyncio.to_thread
 # =========================
 TD_BASE = "https://api.twelvedata.com"
 
-def td_time_series(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
+def td_time_series_sync(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
     url = f"{TD_BASE}/time_series"
     params = {
         "symbol": symbol,
@@ -229,8 +240,7 @@ def td_time_series(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
     df = df.dropna(subset=["datetime", "open", "high", "low", "close"])
     return df
 
-
-def td_price(symbol: str) -> float:
+def td_price_sync(symbol: str) -> float:
     url = f"{TD_BASE}/price"
     params = {"symbol": symbol, "apikey": TWELVE_API_KEY, "format": "JSON"}
     r = requests.get(url, params=params, timeout=15)
@@ -242,6 +252,12 @@ def td_price(symbol: str) -> float:
         raise RuntimeError("No price returned")
     return float(p)
 
+async def td_time_series(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
+    return await asyncio.to_thread(td_time_series_sync, symbol, interval, outputsize)
+
+async def td_price(symbol: str) -> float:
+    return await asyncio.to_thread(td_price_sync, symbol)
+
 
 # =========================
 # ИНДИКАТОРЫ
@@ -249,16 +265,14 @@ def td_price(symbol: str) -> float:
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1 / period, adjust=False).mean()
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
     rs = ma_up / (ma_down.replace(0, np.nan))
     return 100 - (100 / (1 + rs))
-
 
 def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df["high"]
@@ -267,10 +281,9 @@ def atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     prev_close = close.shift(1)
     tr = pd.concat(
         [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1,
+        axis=1
     ).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
-
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def atr_percent(df: pd.DataFrame, period: int = 14) -> float:
     a = atr_series(df, period).iloc[-1]
@@ -279,41 +292,10 @@ def atr_percent(df: pd.DataFrame, period: int = 14) -> float:
         return 0.0
     return float((a / c) * 100.0)
 
-
-def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Wilder ADX. Нужен как фильтр качества: ADX выше — тренд сильнее."""
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr = pd.concat(
-        [(high - low).abs(), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
-        axis=1,
-    ).max(axis=1)
-
-    # Wilder smoothing
-    atr_w = tr.ewm(alpha=1 / period, adjust=False).mean()
-    plus_dm_w = pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean()
-    minus_dm_w = pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean()
-
-    plus_di = 100 * (plus_dm_w / atr_w.replace(0, np.nan))
-    minus_di = 100 * (minus_dm_w / atr_w.replace(0, np.nan))
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-
-    return dx.ewm(alpha=1 / period, adjust=False).mean()
-
-
 def adaptive_atr_threshold(df: pd.DataFrame) -> float:
     base = ATR_THRESHOLD
     if not ADAPTIVE_FILTERS:
         return max(0.0, base) * GLOBAL_ATR_MULT
-
     try:
         a = atr_series(df, 14)
         c = df["close"]
@@ -327,9 +309,29 @@ def adaptive_atr_threshold(df: pd.DataFrame) -> float:
     except Exception:
         return max(0.0, base) * GLOBAL_ATR_MULT
 
+def choppiness_index(df: pd.DataFrame, period: int = 14) -> float:
+    """
+    Примерный Choppiness (0..100): чем выше — тем больше "пила".
+    Формула по ATR sum / range.
+    """
+    try:
+        if len(df) < period + 2:
+            return 50.0
+        a = atr_series(df, 1).tail(period).sum()
+        hi = df["high"].tail(period).max()
+        lo = df["low"].tail(period).min()
+        rng = float(hi - lo)
+        if rng <= 0:
+            return 50.0
+        # 100*log10(sumATR/range)/log10(period) (классика), но нам достаточно масштаба
+        import math
+        return float(100.0 * math.log10(max(a, 1e-9) / rng) / math.log10(period))
+    except Exception:
+        return 50.0
+
 
 # =========================
-# ЛОГИКА СИГНАЛА
+# СИГНАЛ
 # =========================
 @dataclass
 class Signal:
@@ -337,20 +339,26 @@ class Signal:
     direction: str  # CALL/PUT
     probability: int
     price: float
+    atr14_pct: float
     rsi14: float
     ema50: float
     ema200: float
-    atr14_pct: float
     entry_time: datetime
     exit_time: datetime
-    entry_price: float
     expiry_minutes: int
+    entry_price: float
 
+def direction_arrow(direction: str) -> str:
+    return "⬆️ ВВЕРХ" if direction.upper() == "CALL" else "⬇️ ВНИЗ"
 
-def trend_ok(symbol: str) -> Optional[str]:
+async def trend_ok(symbol: str) -> Optional[str]:
+    """
+    Старший тренд (TREND_TF):
+    CALL если EMA50 > EMA200, PUT если EMA50 < EMA200.
+    """
     if not TREND_FILTER:
         return None
-    df = td_time_series(symbol, TREND_TF, 220)
+    df = await td_time_series(symbol, TREND_TF, 220)
     df["ema50"] = ema(df["close"], 50)
     df["ema200"] = ema(df["close"], 200)
     e50 = float(df["ema50"].iloc[-1])
@@ -361,99 +369,133 @@ def trend_ok(symbol: str) -> Optional[str]:
         return "PUT"
     return None
 
+def pick_expiry_minutes(atrp: float, chop: float, impulse: float) -> int:
+    if not HYBRID_MODE:
+        return EXPIRY_MINUTES
+    # если рынок "пилит" — лучше дольше
+    if chop >= HYBRID_CHOP_THRESHOLD:
+        return EXPIRY_SLOW
+    # сильный импульс и вола — быстрее
+    if (atrp >= HYBRID_ATR_BORDER) and (impulse >= HYBRID_IMPULSE_CUTOFF):
+        return EXPIRY_FAST
+    # иначе — дольше (стабильнее)
+    return EXPIRY_SLOW
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def adaptive_thresholds(atr_pct: float, chop: float, impulse: float) -> Tuple[int, int, Tuple[float, float], Tuple[float, float]]:
+    """Возвращает (min_prob, hybrid_min_prob, rsi_band_call, rsi_band_put).
+    Идея: в «пиле/флете» требуем выше вероятность и более строгий RSI,
+    в «импульсе/тренде» можем чуть смягчить порог.
+    """
+    base_min = int(MIN_PROBABILITY)
+    base_hybrid = int(HYBRID_MIN_PROB)
+
+    # базовые полосы RSI (как у нас в debug логике)
+    call_band = (45.0, 65.0)
+    put_band  = (35.0, 55.0)
+
+    if not (ADAPTIVE_PRO_MAX or QUALITY_MODE):
+        return base_min, base_hybrid, call_band, put_band
+
+    adj = 0
+
+    # чем выше "пила" — тем строже
+    if chop >= HYBRID_CHOP_THRESHOLD:
+        adj += 6
+        # в пиле держим RSI ближе к середине
+        call_band = (48.0, 62.0)
+        put_band  = (38.0, 52.0)
+
+    # слабый импульс — повышаем порог
+    if impulse < HYBRID_IMPULSE_CUTOFF:
+        adj += 4
+
+    # низкая волатильность часто даёт ложные 1м сигналы
+    if atr_pct < (ATR_THRESHOLD * 0.85):
+        adj += 3
+
+    # сильный импульс + нормальная волатильность => можно чуть мягче
+    if impulse >= (HYBRID_IMPULSE_CUTOFF + 5.0) and atr_pct >= (ATR_THRESHOLD * 1.2) and chop < HYBRID_CHOP_THRESHOLD:
+        adj -= 2
+
+    # QUALITY_MODE всегда делает строже минимум на +2
+    if QUALITY_MODE:
+        adj = max(adj, 2)
+
+    min_prob = int(clamp(base_min + adj, base_min, 95))
+    hybrid_min = int(clamp(base_hybrid + adj, base_hybrid, 95))
+    return min_prob, hybrid_min, call_band, put_band
 
 async def compute_signal(symbol: str) -> Optional[Signal]:
-    # ВАЖНО: TwelveData для форекса принимает "EUR/USD" (не "EUR/USD " и не "EURUSD")
-    symbol = symbol.strip()
-
-    df = td_time_series(symbol, TF, CANDLES)
+    df = await td_time_series(symbol, TF, CANDLES)
 
     df["ema50"] = ema(df["close"], 50)
     df["ema200"] = ema(df["close"], 200)
     df["rsi14"] = rsi(df["close"], 14)
-    df["adx14"] = adx(df, 14)
 
     close = float(df["close"].iloc[-1])
     ema50_v = float(df["ema50"].iloc[-1])
     ema200_v = float(df["ema200"].iloc[-1])
     rsi_v = float(df["rsi14"].iloc[-1])
-    adx_v = float(df["adx14"].iloc[-1]) if pd.notna(df["adx14"].iloc[-1]) else 0.0
     atrp = atr_percent(df, 14)
 
     thr = adaptive_atr_threshold(df)
     if atrp < thr:
         return None
 
+    # локальный тренд
     trend_up = ema50_v > ema200_v
     trend_down = ema50_v < ema200_v
-    if not (trend_up or trend_down):
+    if not trend_up and not trend_down:
         return None
 
-    direction = "CALL" if trend_up else "PUT"
-
-    # RSI окна чуть более гибкие в QUALITY_MODE, чтобы не "молчал".
-    if direction == "CALL":
-        rsi_ok = (44 <= rsi_v <= 66) if QUALITY_MODE else (45 <= rsi_v <= 65)
-    else:
-        rsi_ok = (34 <= rsi_v <= 56) if QUALITY_MODE else (35 <= rsi_v <= 55)
-    if not rsi_ok:
-        return None
-
-    # Сила тренда (развод EMA) в % от цены
-    trend_strength = abs(ema50_v - ema200_v) / close * 100.0 if close else 0.0
-
-    # Скоринг
+    direction = None
     score = 0
-    score += 35  # EMA тренд
-    score += 35  # RSI подтверждение
 
-    # бонус за волу
-    rel = atrp / max(thr, 0.0001)
-    score += min(18, int(rel * 6))
+    if trend_up:
+        score += 35
+        if 43 <= rsi_v <= 67:
+            score += 35
+            direction = "CALL"
+    elif trend_down:
+        score += 35
+        if 31 <= rsi_v <= 59:
+            score += 35
+            direction = "PUT"
 
-    # ADX фильтр качества
-    # Для 3м достаточно 18+, для 5м хотим 20+.
-    # В QUALITY_MODE этот фильтр реально поднимает win-rate.
-    if QUALITY_MODE:
-        if adx_v < 18:
-            return None
-        score += min(10, int((adx_v - 18) * 0.8))
-
-    probability = max(55, min(92, int(score)))
-
-    # ===== ГИБРИД 3/5 =====
-    # Идея: 3м — когда импульс/тренд реально сильные.
-    # 5м — только если тренд средний, но ADX приличный.
-    expiry = EXPIRY_FAST_MIN
-
-    if FORCE_EXPIRY_MIN in (3, 5):
-        expiry = FORCE_EXPIRY_MIN
-    else:
-        # импульс = (ATR% / порог) и развод EMA
-        impulse = rel
-
-        fast_ok = (probability >= HYBRID_MIN_PROB) and (trend_strength >= (0.12 if QUALITY_MODE else 0.10)) and (impulse >= (1.10 if QUALITY_MODE else 1.05))
-
-        if fast_ok:
-            expiry = EXPIRY_FAST_MIN
-        else:
-            # 5 минут — только если реально есть тренд и ADX не слабый
-            slow_ok = (probability >= max(MIN_PROBABILITY, HYBRID_MIN_PROB + 2)) and (trend_strength >= 0.08) and (adx_v >= (20 if QUALITY_MODE else 18))
-            if slow_ok:
-                expiry = EXPIRY_SLOW_MIN
-            else:
-                # не даём слабый 5м, лучше пропустить
-                return None
-
-    # старший тренд
-    if TREND_FILTER:
-        tdir = trend_ok(symbol)
-        if tdir is not None and tdir != direction:
-            return None
-
-    # финальный порог
-    if probability < MIN_PROBABILITY:
+    if direction is None:
         return None
+
+    # старший тренд: совпадает — бонус, не совпадает — бан
+    if TREND_FILTER:
+        tdir = await trend_ok(symbol)
+        if tdir and tdir != direction:
+            return None
+        if tdir and tdir == direction:
+            score += 12
+
+    rel = atrp / max(thr, 0.0001)
+    vol_bonus = min(20, int(rel * 6))
+    score += vol_bonus
+
+    probability = max(50, min(92, int(score)))
+    chop = choppiness_index(df, 14)
+    impulse = rel  # atr% / thr
+    dyn_min, dyn_hybrid_min, rsi_call_band, rsi_put_band = adaptive_thresholds(atrp, chop, impulse)
+    min_prob = dyn_hybrid_min if HYBRID_MODE else dyn_min
+    if probability < min_prob:
+        return None
+
+    # Доп. фильтр RSI (включается в QUALITY_MODE / ADAPTIVE_PRO_MAX)
+    if QUALITY_MODE or ADAPTIVE_PRO_MAX:
+        lo, hi = (rsi_call_band if direction == "CALL" else rsi_put_band)
+        if not (lo <= rsi14 <= hi):
+            return None
+    # гибрид: выбираем экспирацию (3/5)
+    expiry = pick_expiry_minutes(atrp, chop, impulse)
 
     entry = now_tz()
     exit_ = entry + timedelta(minutes=expiry)
@@ -463,17 +505,20 @@ async def compute_signal(symbol: str) -> Optional[Signal]:
         direction=direction,
         probability=probability,
         price=close,
+        atr14_pct=atrp,
         rsi14=rsi_v,
         ema50=ema50_v,
         ema200=ema200_v,
-        atr14_pct=atrp,
         entry_time=entry,
         exit_time=exit_,
-        entry_price=close,
         expiry_minutes=expiry,
+        entry_price=close,
     )
 
 
+# =========================
+# COOLDOWN
+# =========================
 def in_cooldown(symbol: str) -> bool:
     ts = STATS["cooldown"].get(symbol)
     if not ts:
@@ -481,39 +526,12 @@ def in_cooldown(symbol: str) -> bool:
     ago = minutes_ago(ts)
     return (ago is not None) and (ago < COOLDOWN_MINUTES)
 
-
 def mark_cooldown(symbol: str) -> None:
     STATS["cooldown"][symbol] = now_tz().isoformat()
 
 
-async def pick_signals(symbols: List[str]) -> List[Signal]:
-    found: List[Signal] = []
-    for s in symbols:
-        if in_cooldown(s):
-            continue
-        try:
-            sig = await compute_signal(s)
-        except Exception as e:
-            # иногда TwelveData ругается на символ — пропустим
-            log.warning("compute_signal error %s: %s", s, str(e)[:120])
-            continue
-        if sig:
-            found.append(sig)
-
-    found.sort(key=lambda x: x.probability, reverse=True)
-    if not found:
-        return []
-
-    if SEND_MODE == "ALL":
-        return found
-    if SEND_MODE == "BEST":
-        return found[:1]
-    # TOP
-    return found[:max(1, min(3, TOP_N))]
-
-
 # =========================
-# TELEGRAM: сообщения
+# TELEGRAM: UI
 # =========================
 def winloss_keyboard(signal_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -523,39 +541,45 @@ def winloss_keyboard(signal_id: str) -> InlineKeyboardMarkup:
         ]
     ])
 
-
 def signal_message(sig: Signal) -> str:
-    # супер коротко под Pocket Option
+    # формат как ты просил (HTML + эмодзи)
     return (
-        f"<b>📊 СИГНАЛ {sig.symbol}</b>\n"
-        f"🎯 <b>Направление:</b> {direction_label(sig.direction)}\n"
+        f"📊 <b>СИГНАЛ {sig.symbol}</b>\n"
+        f"🎯 <b>Направление:</b> {direction_arrow(sig.direction)}\n"
         f"🔥 <b>Вероятность:</b> {sig.probability}%\n"
         f"⌛️ <b>Экспирация:</b> {sig.expiry_minutes} мин\n\n"
         f"⏱ <b>Вход:</b> {fmt_time(sig.entry_time)}\n"
         f"🏁 <b>Выход:</b> {fmt_time(sig.exit_time)}\n"
-        f"🌍 <b>Таймзона:</b> {TIMEZONE_NAME}"
+        f"🌍 <b>{TIMEZONE_NAME}</b>"
     )
 
+def expiry_message(symbol: str, expiry_minutes: int, direction: str, entry_price: float, last_price: float) -> str:
+    # результат “по котировкам”
+    quote_win = (last_price > entry_price) if direction.upper() == "CALL" else (last_price < entry_price)
+    result = "✅ WIN" if quote_win else "❌ LOSS"
+    move = "⬆️ ВВЕРХ" if last_price > entry_price else ("⬇️ ВНИЗ" if last_price < entry_price else "➡️ РОВНО")
+    return (
+        f"⏱ <b>Экспирация {expiry_minutes} мин</b> по <b>{symbol}</b>\n"
+        f"📈 <b>График пошёл:</b> {move}\n"
+        f"✅ <b>По котировкам:</b> {result}"
+    )
 
 def offtime_message() -> str:
     return (
-        f"🌙 Сейчас не торговое время.\n"
-        f"📅 Торгую <b>ПН–ПТ</b>\n"
-        f"⏰ <b>{TRADE_START}–{TRADE_END}</b> ({TIMEZONE_NAME})"
+        f"🌙 <b>Сейчас не торговое время.</b>\n"
+        f"📅 Торгую ПН–ПТ\n"
+        f"⏰ {TRADE_START}–{TRADE_END} (<b>{TIMEZONE_NAME}</b>)"
     )
 
-
 def weak_market_message() -> str:
-    return "📉 Рынок слабый — сильных сигналов нет. Я продолжаю анализировать…"
-
+    return "📉 <b>Рынок слабый — сильных сигналов нет.</b>\nЯ продолжаю анализировать…"
 
 def api_limit_message() -> str:
     return (
-        "⚠️ Данные временно недоступны (лимит API).\n"
-        "Я не молчу — просто провайдер ограничил запросы.\n"
-        "Уменьши частоту или количество пар."
+        "⚠️ <b>Данные временно недоступны (лимит API).</b>\n"
+        "Я не молчу — провайдер ограничил запросы.\n"
+        "Уменьши частоту/список пар или подожди."
     )
-
 
 async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None) -> None:
     await context.bot.send_message(
@@ -568,50 +592,62 @@ async def post_to_channel(context: ContextTypes.DEFAULT_TYPE, text: str, reply_m
 
 
 # =========================
-# AUTO EXPIRY REPORT
+# JOBS
 # =========================
 async def job_expiry_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     data = context.job.data or {}
     symbol = data["symbol"]
     direction = data["direction"]
     entry_price = float(data["entry_price"])
-    expiry_min = int(data.get("expiry_min", 0) or 0)
+    expiry_minutes = int(data.get("expiry_minutes", EXPIRY_MINUTES))
 
     try:
-        last_price = td_price(symbol)
+        last_price = await td_price(symbol)
     except Exception as e:
-        log.warning("Expiry price fetch failed for %s: %s", symbol, str(e)[:120])
+        log.warning("Expiry price fetch failed for %s: %s", symbol, e)
         return
 
-    move_label = sign_dir_from_prices(entry_price, last_price)
-    quote_win = (last_price > entry_price) if direction.upper() == "CALL" else (last_price < entry_price)
-    quote_result = "✅ WIN" if quote_win else "❌ LOSS"
+    await post_to_channel(context, expiry_message(symbol, expiry_minutes, direction, entry_price, last_price))
 
-    # Формат как ты хотел + жирный (HTML)
-    text = (
-        f"⏱ <b>Экспирация {expiry_min} мин</b> по <b>{symbol}</b>\n"
-        f"📈 <b>График пошёл:</b> {move_label}\n"
-        f"✅ <b>По котировкам:</b> {quote_result}"
-    )
-    await post_to_channel(context, text)
-
-
-# =========================
-# JOBS
-# =========================
 async def job_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
     ensure_day_reset()
     now = now_tz()
 
-    # торговое время
     if not is_trading_time(now):
         if can_send_throttled("last_oftime_msg", OFFTIME_MSG_COOLDOWN_MINUTES):
             await post_to_channel(context, offtime_message())
         return
 
-    # ищем сигналы
+    found: List[Signal] = []
     try:
-        signals = await pick_signals(SYMBOLS)
+        for s in SYMBOLS:
+            if in_cooldown(s):
+                continue
+
+            sig = await compute_signal(s)
+            if sig:
+                found.append(sig)
+
+                # EARLY_BREAK: если нашли уже очень сильный — не тратим кредиты
+                if EARLY_BREAK and sig.probability >= EARLY_BREAK_PROB:
+                    break
+
+        def _effective_prob(s: Signal) -> float:
+            p = float(s.probability)
+            if DIVERSIFY_WINDOW_MINUTES > 0:
+                last = STATS.get('last_signal') or {}
+                if last.get('symbol') == s.symbol and last.get('time'):
+                    try:
+                        t_last = datetime.fromisoformat(last['time'])
+                        dtm = (now_tz() - t_last).total_seconds() / 60.0
+                        if dtm < float(DIVERSIFY_WINDOW_MINUTES):
+                            p -= float(DIVERSIFY_PENALTY_POINTS)
+                    except Exception:
+                        pass
+            return p
+
+        found.sort(key=_effective_prob, reverse=True)
+
     except Exception as e:
         msg = str(e).lower()
         if ("credit" in msg) or ("limit" in msg) or ("429" in msg) or ("too many" in msg):
@@ -621,23 +657,28 @@ async def job_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Signal scan error: %s", e)
         return
 
-    if not signals:
+    if not found:
         if can_send_throttled("last_weak_msg", WEAK_MSG_COOLDOWN_MINUTES):
             await post_to_channel(context, weak_market_message())
         return
 
-    # отправляем 1–3 лучших
-    for sig in signals:
+    # режим выдачи
+    if SEND_MODE == "ALL":
+        to_send = found
+    elif SEND_MODE == "BEST":
+        to_send = found[:1]
+    else:
+        to_send = found[:max(1, TOP_N)]
+
+    for sig in to_send:
         STATS["signals"] += 1
         mark_cooldown(sig.symbol)
 
-        # id только для кнопок
         signal_id = f"{sig.entry_time.strftime('%Y%m%d%H%M%S')}_{sig.symbol.replace('/', '')}"
-        STATS["last_signal"] = {"symbol": sig.symbol, "time": sig.entry_time.isoformat(), "prob": sig.probability, "exp": sig.expiry_minutes}
+        STATS["last_signal"] = {"symbol": sig.symbol, "time": sig.entry_time.isoformat(), "prob": sig.probability}
 
         await post_to_channel(context, signal_message(sig), reply_markup=winloss_keyboard(signal_id))
 
-        # авто-отчёт по экспирации
         delay = sig.expiry_minutes * 60 + 2
         context.job_queue.run_once(
             job_expiry_report,
@@ -646,21 +687,17 @@ async def job_signals(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "symbol": sig.symbol,
                 "direction": sig.direction,
                 "entry_price": sig.entry_price,
-                "expiry_min": sig.expiry_minutes,
+                "expiry_minutes": sig.expiry_minutes,
             },
             name=f"expiry_{signal_id}",
         )
 
-
 async def job_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not PULSE_ENABLED:
-        return
-    if not STATS.get("pulse_on", True):
+    if not PULSE_ENABLED or not STATS.get("pulse_on", True):
         return
     if not is_trading_time(now_tz()):
         return
     await post_to_channel(context, f"🕒 <b>{CHANNEL_NAME}</b>: бот жив, анализирую рынок…")
-
 
 async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     ensure_day_reset()
@@ -671,7 +708,7 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     txt = (
         f"📌 <b>{CHANNEL_NAME} — ЕЖЕДНЕВНЫЙ ОТЧЁТ</b>\n"
-        f"🗓 <b>Дата:</b> {now_tz().strftime('%d.%m.%Y')} ({TIMEZONE_NAME})\n\n"
+        f"🗓 <b>Дата:</b> {now_tz().strftime('%d.%m.%Y')} (<b>{TIMEZONE_NAME}</b>)\n\n"
         f"✉️ <b>Сигналов:</b> {s}\n"
         f"✅ <b>WIN:</b> {w}\n"
         f"❌ <b>LOSS:</b> {l}\n"
@@ -686,29 +723,37 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
 def is_owner(user_id: int) -> bool:
     return OWNER_ID != 0 and user_id == OWNER_ID
 
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Ответ всегда — даже если OWNER_ID не совпал
+    hybrid_txt = "ON (3m/5m)" if HYBRID_MODE else f"OFF ({EXPIRY_MINUTES}m)"
     await update.message.reply_text(
-        (
-            "✅ <b>IMPULS запущен.</b>\n\n"
-            f"🌍 Таймзона: <b>{TIMEZONE_NAME}</b>\n"
-            f"🗓 Торговля: <b>ПН–ПТ {TRADE_START}–{TRADE_END}</b>\n"
-            f"📌 Пары: <b>{', '.join(SYMBOLS)}</b>\n"
-            f"⚙️ Режим: <b>{SEND_MODE}</b> TOP_N={TOP_N} | Interval={SIGNAL_INTERVAL_SECONDS}s\n\n"
-            "Команды (владелец):\n"
-            "/test\n/stats\n/report_now\n/pulse_on\n/pulse_off\n"
-        ),
+        f"✅ <b>IMPULS запущен.</b>\n\n"
+        f"Канал: <b>{CHANNEL_NAME}</b>\n"
+        f"Таймзона: <b>{TIMEZONE_NAME}</b>\n"
+        f"Торговля: <b>ПН–ПТ {TRADE_START}–{TRADE_END}</b>\n"
+        f"Гибрид: <b>{hybrid_txt}</b>\n"
+        f"TF: <b>{TF}</b>\n"
+        f"Symbols: <b>{', '.join(SYMBOLS)}</b>\n\n"
+        f"<b>Команды (владелец):</b>\n"
+        f"/test\n/stats\n/report_now\n/pulse_on\n/pulse_off\n/whoami\n/debug_pairs\n",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
 
+async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id if update.effective_user else 0
+    await update.message.reply_text(
+        f"🆔 user_id: <b>{uid}</b>\n"
+        f"👑 owner: <b>{'YES' if is_owner(uid) else 'NO'}</b>\n"
+        f"OWNER_ID env: <b>{OWNER_ID}</b>",
+        parse_mode=ParseMode.HTML,
+    )
 
 async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
-    await post_to_channel(context, "✅ <b>ТЕСТ</b>: бот может писать в канал (OK)")
-    await update.message.reply_text("✅ Отправил тест в канал.", parse_mode=ParseMode.HTML)
-
+    await post_to_channel(context, "✅ <b>ТЕСТ:</b> бот может писать в канал (OK)")
+    await update.message.reply_text("✅ Тест отправлен в канал.", parse_mode=ParseMode.HTML)
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
@@ -720,17 +765,14 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wr = (w / max(1, w + l)) * 100.0
     last = STATS.get("last_signal")
     await update.message.reply_text(
-        (
-            "📊 <b>Статистика (за сегодня)</b>\n"
-            f"✉️ Сигналов: <b>{s}</b>\n"
-            f"✅ WIN: <b>{w}</b>\n"
-            f"❌ LOSS: <b>{l}</b>\n"
-            f"🎯 WinRate: <b>{wr:.1f}%</b>\n"
-            f"🧾 Последний: <code>{last if last else '—'}</code>"
-        ),
+        f"📊 <b>Статистика (за сегодня)</b>\n"
+        f"Сигналов: <b>{s}</b>\n"
+        f"WIN: <b>{w}</b>\n"
+        f"LOSS: <b>{l}</b>\n"
+        f"WinRate: <b>{wr:.1f}%</b>\n"
+        f"Последний: <code>{last if last else '—'}</code>",
         parse_mode=ParseMode.HTML,
     )
-
 
 async def report_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
@@ -738,13 +780,11 @@ async def report_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await job_daily_report(context)
     await update.message.reply_text("✅ Отчёт отправлен в канал.", parse_mode=ParseMode.HTML)
 
-
 async def pulse_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
         return
     STATS["pulse_on"] = True
     await update.message.reply_text("✅ Пульс включён.", parse_mode=ParseMode.HTML)
-
 
 async def pulse_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_owner(update.effective_user.id):
@@ -752,6 +792,32 @@ async def pulse_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     STATS["pulse_on"] = False
     await update.message.reply_text("✅ Пульс выключен.", parse_mode=ParseMode.HTML)
 
+async def debug_pairs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Диагностика: что проходит/не проходит по парам (может тратить кредиты TwelveData).
+    """
+    if not is_owner(update.effective_user.id):
+        return
+
+    lines = []
+    try:
+        for s in SYMBOLS:
+            if in_cooldown(s):
+                lines.append(f"{s}: CD ⏳")
+                continue
+            try:
+                sig = await compute_signal(s)
+                if sig:
+                    lines.append(f"{s}: PASS ✅ | prob={sig.probability}% | exp={sig.expiry_minutes}m | ATR={sig.atr14_pct:.3f}% | RSI={sig.rsi14:.1f}")
+                else:
+                    lines.append(f"{s}: REJECT ❌")
+            except Exception as e:
+                lines.append(f"{s}: ERROR ❌ | {str(e)[:80]}")
+    except Exception as e:
+        await update.message.reply_text(f"ERROR: {e}", parse_mode=ParseMode.HTML)
+        return
+
+    await update.message.reply_text("<b>DEBUG PAIRS</b>\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
@@ -770,10 +836,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if action == "win":
         STATS["win"] += 1
-        await q.message.reply_text("✅ <b>WIN</b> отмечен", parse_mode=ParseMode.HTML)
+        await q.message.reply_text("✅ WIN отмечен", parse_mode=ParseMode.HTML)
     elif action == "loss":
         STATS["loss"] += 1
-        await q.message.reply_text("❌ <b>LOSS</b> отмечен", parse_mode=ParseMode.HTML)
+        await q.message.reply_text("❌ LOSS отмечен", parse_mode=ParseMode.HTML)
 
 
 # =========================
@@ -786,47 +852,35 @@ def main() -> None:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("whoami", whoami_cmd))
     app.add_handler(CommandHandler("test", test_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("report_now", report_now_cmd))
     app.add_handler(CommandHandler("pulse_on", pulse_on_cmd))
     app.add_handler(CommandHandler("pulse_off", pulse_off_cmd))
+    app.add_handler(CommandHandler("debug_pairs", debug_pairs_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
 
     if app.job_queue is None:
         raise RuntimeError("JobQueue не активен. Убедись, что установлен python-telegram-bot[job-queue]==22.5")
 
+    # Сигналы
     app.job_queue.run_repeating(job_signals, interval=SIGNAL_INTERVAL_SECONDS, first=10, name="signals")
+
+    # Пульс
     app.job_queue.run_repeating(job_pulse, interval=PULSE_INTERVAL_SECONDS, first=60, name="pulse")
 
+    # Ежедневный отчёт (по TZ)
     report_t = time(hour=REPORT_HOUR, minute=REPORT_MINUTE, tzinfo=TZ)
     app.job_queue.run_daily(job_daily_report, time=report_t, name="daily_report")
 
     log.info(
-        "IMPULS v4.1 started | TZ=%s | Trade=%s-%s | Symbols=%s | Mode=%s TOP_N=%s | Interval=%ss | Hybrid=%s fast=%sm slow=%sm force=%s | MINP=%s HYB=%s | ATR=%s adaptive=%s mult=%s | Trend=%s %s | QUALITY=%s",
-        TIMEZONE_NAME,
-        TRADE_START,
-        TRADE_END,
-        SYMBOLS,
-        SEND_MODE,
-        TOP_N,
-        SIGNAL_INTERVAL_SECONDS,
-        True,
-        EXPIRY_FAST_MIN,
-        EXPIRY_SLOW_MIN,
-        FORCE_EXPIRY_MIN,
-        MIN_PROBABILITY,
-        HYBRID_MIN_PROB,
-        ATR_THRESHOLD,
-        ADAPTIVE_FILTERS,
-        GLOBAL_ATR_MULT,
-        TREND_FILTER,
-        TREND_TF,
-        QUALITY_MODE,
+        "IMPULS started | TZ=%s | Trade=%s-%s | Symbols=%s | Mode=%s TOP_N=%s | TF=%s | Trend=%s TrendTF=%s | Hybrid=%s (fast=%sm slow=%sm) | Interval=%ss",
+        TIMEZONE_NAME, TRADE_START, TRADE_END, SYMBOLS, SEND_MODE, TOP_N, TF,
+        TREND_FILTER, TREND_TF, HYBRID_MODE, EXPIRY_FAST, EXPIRY_SLOW, SIGNAL_INTERVAL_SECONDS
     )
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
